@@ -39,5 +39,10 @@ mkdir -p /workspace
 chown -R "$SSH_USER":"$SSH_USER" /workspace 2>/dev/null || true
 echo ">> /workspace передан пользователю $SSH_USER"
 
+# Тулчейн-volume тоже должен принадлежать SSH-пользователю (он запускает сборки).
+# chown без -R: на большом SDK рекурсия дорогая, а содержимое уже создаётся под ним.
+mkdir -p /opt/toolchain
+chown "$SSH_USER":"$SSH_USER" /opt/toolchain 2>/dev/null || true
+
 service ssh start
 exec tail -f /dev/null

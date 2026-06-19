@@ -160,8 +160,8 @@ class Progress:
         self.steps: List[str] = []
         self.last_edit = 0.0
 
-    async def start(self):
-        msg = await self.bot.send_message(self.chat_id, "🟢 Принято. Nexus взялся за задачу…")
+    async def start(self, text: str = "🟢 Принято. Nexus взялся за задачу…"):
+        msg = await self.bot.send_message(self.chat_id, text)
         self.message_id = msg.message_id
 
     async def add(self, text: str, force: bool = False):
@@ -231,6 +231,77 @@ async def _execute(bot, chat_id: int, prompt: str, allow_gh: bool):
         await prog.final(f"💥 Непредвиденная ошибка: {str(e)[:400]}")
 
 
+async def _execute_build(bot, chat_id: int):
+    """Детерминированная сборка APK (без LLM): прогон build-скрипта по SSH + доставка артефакта."""
+    prog = Progress(bot, chat_id)
+    await prog.start("🔨 Собираю APK… (первый раз — несколько минут)")
+    artifacts: List[str] = []
+    try:
+        remote_cmd = "bash -lc 'setup-toolchain.sh 1>&2 && build-apk.sh'"
+        async with asyncssh.connect(
+            SSH_HOST,
+            port=SSH_PORT,
+            username=SSH_USER,
+            client_keys=[SSH_KEY_PATH],
+            known_hosts=None,
+            keepalive_interval=30,
+        ) as conn:
+            proc = await conn.create_process(remote_cmd)
+            async for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("ARTIFACT:"):
+                    artifacts.append(line[len("ARTIFACT:"):])
+                else:
+                    await prog.add(f"🔨 {line[:80]}")
+
+            stderr_text = await proc.stderr.read()
+            await proc.wait()
+
+            if proc.exit_status:
+                await prog.final(f"❌ Сборка упала (exit {proc.exit_status}).\n\n{(stderr_text or '')[-1200:]}")
+                return
+            if not artifacts:
+                await prog.final("⚠️ Сборка прошла, но APK не найден.")
+                return
+
+            # выкачиваем артефакт(ы) по SFTP тем же SSH и шлём в Telegram
+            await prog.add("📦 Забираю APK…", force=True)
+            async with conn.start_sftp_client() as sftp:
+                for remote in artifacts:
+                    name = os.path.basename(remote)
+                    local = os.path.join(tempfile.gettempdir(), name)
+                    await sftp.get(remote, local)
+                    try:
+                        size = os.path.getsize(local)
+                        if size > 49 * 1024 * 1024:  # лимит бота Telegram ~50 МБ
+                            await bot.send_message(
+                                chat_id,
+                                f"⚠️ {name} = {size // 1024 // 1024} МБ — больше лимита Telegram (50 МБ).\n"
+                                f"Артефакт на сервере: {remote}",
+                            )
+                        else:
+                            with open(local, "rb") as fh:
+                                await bot.send_document(chat_id, document=fh, filename=name)
+                    finally:
+                        try:
+                            os.remove(local)
+                        except OSError:
+                            pass
+            await prog.final("✅ Сборка готова, APK отправлен.")
+
+    except asyncio.CancelledError:
+        await prog.final("🛑 Сборка отменена.")
+        raise
+    except asyncssh.Error as e:
+        logger.exception("SSH ошибка сборки")
+        await prog.final(f"💥 SSH-сбой при сборке: {str(e)[:400]}")
+    except Exception as e:
+        logger.exception("Сбой сборки")
+        await prog.final(f"💥 Ошибка сборки: {str(e)[:400]}")
+
+
 async def run_job(update: Update, prompt: str, allow_gh: bool):
     if not prompt.strip():
         await update.message.reply_text("Пустая задача. Напиши, что нужно сделать.")
@@ -290,6 +361,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🎙️ голосовое — распознаю и выполню как задачу\n"
         "• `/pr <задача>` — задача + открыть PR в develop\n"
         "• `/fix [уточнение]` — прочитать замечания к открытому PR и выкатить правки в ту же ветку\n"
+        "• `/build` — собрать APK текущего состояния и прислать сюда\n"
         "• `/cancel` — прервать текущую задачу",
         parse_mode="Markdown",
     )
@@ -378,6 +450,18 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сейчас нечего отменять.")
 
 
+async def cmd_build(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    t = _running.get("task")
+    if t and not t.done():
+        await update.message.reply_text("⚠️ Я ещё занят предыдущей задачей. Дождись её или /cancel.")
+        return
+    chat_id = update.effective_chat.id
+    bot = update.get_bot()
+    _running["task"] = asyncio.create_task(_execute_build(bot, chat_id))
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Update вызвал ошибку: %s", context.error)
 
@@ -388,6 +472,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("pr", cmd_pr))
     app.add_handler(CommandHandler("fix", cmd_fix))
+    app.add_handler(CommandHandler("build", cmd_build))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

@@ -15,6 +15,7 @@ services:
     volumes:
       - ./workspace:/workspace
       - ./ssh-key.pub:/home/claude-ssh/.ssh/authorized_keys:ro
+      - toolchain:/opt/toolchain          # Android SDK + Flutter + кэши (persistent)
     restart: unless-stopped
 
   telegram-bot:
@@ -37,3 +38,6 @@ services:
     depends_on:
       - claude-worker
     restart: unless-stopped
+
+volumes:
+  toolchain:

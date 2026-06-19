@@ -23,6 +23,33 @@ RUN chmod +x /usr/local/bin/setup-repo.sh
 COPY worker-entrypoint.sh /usr/local/bin/worker-entrypoint.sh
 RUN chmod +x /usr/local/bin/worker-entrypoint.sh
 
+# --- Android/Flutter build toolchain ---
+# JDK 17 + fvm ставим в образ (лёгкое, стабильное). Сам Android SDK + Flutter
+# версии + кэши gradle/pub живут в persistent-volume /opt/toolchain (ставит
+# setup-toolchain.sh при первом /build).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      openjdk-17-jdk-headless unzip wget xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# fvm: ставим официальным скриптом, затем кладём бинарь в системный /usr/local/bin.
+# Под root скрипт инсталлит fvm в /root/.fvm_flutter/bin — это недоступно
+# пользователю claude-ssh (домашняя папка root), отсюда было `fvm: command not found`.
+# `fvm --version` в конце валидирует установку прямо на этапе сборки.
+RUN set -eux; \
+    curl -fsSL https://fvm.app/install.sh | bash; \
+    fvmbin="$(find / -type f -path '*bin/fvm' 2>/dev/null | head -1)"; \
+    install -m 0755 "$fvmbin" /usr/local/bin/fvm; \
+    fvm --version
+
+# Статический env тулчейна для login-сессий (бот заходит через bash -lc)
+COPY toolchain-env.sh /etc/profile.d/10-toolchain.sh
+RUN chmod 644 /etc/profile.d/10-toolchain.sh
+
+# Скрипты: разовая установка тулчейна и детерминированная сборка APK
+COPY setup-toolchain.sh /usr/local/bin/setup-toolchain.sh
+COPY build-apk.sh /usr/local/bin/build-apk.sh
+RUN chmod +x /usr/local/bin/setup-toolchain.sh /usr/local/bin/build-apk.sh
+
 # Создаём пользователя для SSH
 RUN useradd -m -s /bin/bash claude-ssh && \
     mkdir -p /home/claude-ssh/.ssh && \
