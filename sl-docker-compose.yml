@@ -6,6 +6,12 @@ services:
     container_name: claude-worker
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      # git/github auth + откуда и какую ветку тянуть
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - SWEET_LIMIT_REPO=${SWEET_LIMIT_REPO:-https://github.com/Tsezia/sweet_limit.git}
+      - BASE_BRANCH=${BASE_BRANCH:-develop}
+      - GIT_USER_NAME=${GIT_USER_NAME:-SLNexus Bot}
+      - GIT_USER_EMAIL=${GIT_USER_EMAIL:-slnexus-bot@users.noreply.github.com}
     volumes:
       - ./workspace:/workspace
       - ./ssh-key.pub:/home/claude-ssh/.ssh/authorized_keys:ro
