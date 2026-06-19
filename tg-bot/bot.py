@@ -268,6 +268,8 @@ async def _execute_build(bot, chat_id: int):
 
             # выкачиваем артефакт(ы) по SFTP тем же SSH и шлём в Telegram
             await prog.add("📦 Забираю APK…", force=True)
+            sent = 0
+            skipped = 0
             async with conn.start_sftp_client() as sftp:
                 for remote in artifacts:
                     name = os.path.basename(remote)
@@ -276,20 +278,33 @@ async def _execute_build(bot, chat_id: int):
                     try:
                         size = os.path.getsize(local)
                         if size > 49 * 1024 * 1024:  # лимит бота Telegram ~50 МБ
+                            skipped += 1
                             await bot.send_message(
                                 chat_id,
                                 f"⚠️ {name} = {size // 1024 // 1024} МБ — больше лимита Telegram (50 МБ).\n"
                                 f"Артефакт на сервере: {remote}",
                             )
                         else:
+                            sent += 1
                             with open(local, "rb") as fh:
                                 await bot.send_document(chat_id, document=fh, filename=name)
+                            # успешно отправили — убираем артефакт с сервера, чтобы не копился
+                            try:
+                                await sftp.remove(remote)
+                            except Exception:
+                                pass
                     finally:
                         try:
                             os.remove(local)
                         except OSError:
                             pass
-            await prog.final("✅ Сборка готова, APK отправлен.")
+
+            if sent and not skipped:
+                await prog.final("✅ Сборка готова, APK отправлен.")
+            elif sent and skipped:
+                await prog.final(f"✅ Сборка готова. Отправлено: {sent}, пропущено по размеру: {skipped} (путь выше).")
+            else:
+                await prog.final("✅ Сборка готова, но APK не влез в лимит Telegram — путь на сервере выше.")
 
     except asyncio.CancelledError:
         await prog.final("🛑 Сборка отменена.")
