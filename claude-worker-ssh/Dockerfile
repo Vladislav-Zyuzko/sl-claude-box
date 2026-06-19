@@ -19,6 +19,10 @@ RUN apt-get update && apt-get install -y openssh-server curl gpg && \
 COPY setup-repo.sh /usr/local/bin/setup-repo.sh
 RUN chmod +x /usr/local/bin/setup-repo.sh
 
+# Entrypoint: прокидывает env контейнера в SSH-сессии через /etc/profile.d
+COPY worker-entrypoint.sh /usr/local/bin/worker-entrypoint.sh
+RUN chmod +x /usr/local/bin/worker-entrypoint.sh
+
 # Создаём пользователя для SSH
 RUN useradd -m -s /bin/bash claude-ssh && \
     mkdir -p /home/claude-ssh/.ssh && \
@@ -41,5 +45,5 @@ EXPOSE 22
 # Создаём скрипт запуска (исправляет проблему с PID 1)
 RUN mkdir -p /var/run/sshd
 
-# Запускаем SSH и держим контейнер живым
-CMD service ssh start && tail -f /dev/null
+# Запускаем SSH и держим контейнер живым (env прокидывается в profile.d)
+CMD ["/usr/local/bin/worker-entrypoint.sh"]

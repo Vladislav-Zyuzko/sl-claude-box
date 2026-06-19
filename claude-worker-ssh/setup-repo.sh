@@ -26,10 +26,24 @@ echo ">> gh auth: токен берётся из окружения GITHUB_TOKEN
 gh auth setup-git
 
 if [ -d "${WORKDIR}/.git" ]; then
-  echo ">> репо уже есть, обновляю ветку ${BASE_BRANCH}"
+  echo ">> репо есть — привожу к чистому ${BASE_BRANCH}"
   git -C "${WORKDIR}" fetch origin --prune
-  git -C "${WORKDIR}" checkout "${BASE_BRANCH}"
-  git -C "${WORKDIR}" pull --ff-only origin "${BASE_BRANCH}"
+  # прерываем возможные недоделанные операции от прошлой задачи
+  git -C "${WORKDIR}" merge --abort  2>/dev/null || true
+  git -C "${WORKDIR}" rebase --abort 2>/dev/null || true
+
+  if [ "${KEEP_LOCAL_CHANGES:-0}" = "1" ]; then
+    # мягкий режим для ручной отладки — не выкидывать локальные правки
+    git -C "${WORKDIR}" checkout "${BASE_BRANCH}"
+    git -C "${WORKDIR}" pull --ff-only origin "${BASE_BRANCH}"
+  else
+    # боевой режим: чистый старт каждой задачи.
+    # -f выкидывает правки в tracked-файлах, reset --hard выравнивает на origin,
+    # clean -fd сносит untracked мусор (ignored-артефакты вроде build/ не трогаем).
+    git -C "${WORKDIR}" checkout -f "${BASE_BRANCH}"
+    git -C "${WORKDIR}" reset --hard "origin/${BASE_BRANCH}"
+    git -C "${WORKDIR}" clean -fd
+  fi
 else
   echo ">> клонирую ${REPO_URL} -> ${WORKDIR}"
   git clone "${REPO_URL}" "${WORKDIR}"
