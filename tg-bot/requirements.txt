@@ -1,3 +1,4 @@
 python-telegram-bot==22.6
 asyncssh==2.15.0
 faster-whisper==1.0.3
+requests==2.32.3

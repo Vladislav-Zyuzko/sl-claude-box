@@ -55,7 +55,7 @@ def is_allowed(user_id: int) -> bool:
 
 
 # ===== ЗАПУСК ЗАДАЧИ В ВОРКЕРЕ (SSH + stream-json) =====
-async def stream_task(task_text: str, open_pr: bool):
+async def stream_task(prompt: str, allow_gh: bool):
     """
     Асинхронный генератор. Подключается к воркеру по SSH, дёргает setup-repo.sh,
     затем запускает Claude headless со stream-json. Промпт отдаём в stdin,
@@ -64,11 +64,10 @@ async def stream_task(task_text: str, open_pr: bool):
       ("log",   str)   — строка не-JSON (например, вывод setup-repo.sh)
       ("end",   dict)  — {"exit": код, "stderr": текст}
     """
-    # allowlist git всегда; gh — только если просили PR (жёсткий гейт «PR по запросу»)
+    # allowlist git всегда; gh — только когда нужен PR / чтение PR (жёсткий гейт)
     tools = '--allowedTools "Bash(git *)"'
-    if open_pr:
+    if allow_gh:
         tools += ' "Bash(gh *)"'
-    pr_suffix = "\n\nКогда всё готово и закоммичено — открой PR в develop." if open_pr else ""
 
     inner = (
         f"cd {PROJECT_DIR} && "
@@ -79,7 +78,7 @@ async def stream_task(task_text: str, open_pr: bool):
     # login-shell, чтобы подхватился /etc/profile.d/worker-env.sh с токенами
     remote_cmd = f"bash -lc '{inner}'"
 
-    logger.info("SSH задача (open_pr=%s): %s", open_pr, inner)
+    logger.info("SSH задача (gh=%s): %s", allow_gh, inner)
 
     async with asyncssh.connect(
         SSH_HOST,
@@ -92,7 +91,7 @@ async def stream_task(task_text: str, open_pr: bool):
         proc = await conn.create_process(remote_cmd)
 
         # промпт задачи -> stdin
-        proc.stdin.write(task_text + pr_suffix)
+        proc.stdin.write(prompt)
         proc.stdin.write_eof()
 
         async for line in proc.stdout:
@@ -193,13 +192,13 @@ class Progress:
 _running = {"task": None}  # type: ignore
 
 
-async def _execute(bot, chat_id: int, task_text: str, open_pr: bool):
+async def _execute(bot, chat_id: int, prompt: str, allow_gh: bool):
     prog = Progress(bot, chat_id)
     await prog.start()
     result: Optional[dict] = None
     stderr_tail = ""
     try:
-        async for kind, payload in stream_task(task_text, open_pr):
+        async for kind, payload in stream_task(prompt, allow_gh):
             if kind == "event":
                 if payload.get("type") == "result":
                     result = payload
@@ -232,8 +231,8 @@ async def _execute(bot, chat_id: int, task_text: str, open_pr: bool):
         await prog.final(f"💥 Непредвиденная ошибка: {str(e)[:400]}")
 
 
-async def run_job(update: Update, task_text: str, open_pr: bool):
-    if not task_text.strip():
+async def run_job(update: Update, prompt: str, allow_gh: bool):
+    if not prompt.strip():
         await update.message.reply_text("Пустая задача. Напиши, что нужно сделать.")
         return
 
@@ -246,7 +245,7 @@ async def run_job(update: Update, task_text: str, open_pr: bool):
 
     chat_id = update.effective_chat.id
     bot = update.get_bot()
-    _running["task"] = asyncio.create_task(_execute(bot, chat_id, task_text, open_pr))
+    _running["task"] = asyncio.create_task(_execute(bot, chat_id, prompt, allow_gh))
 
 
 # ===== РАСПОЗНАВАНИЕ ГОЛОСА (faster-whisper, локально на сервере) =====
@@ -290,6 +289,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• обычное сообщение — задача без PR\n"
         "• 🎙️ голосовое — распознаю и выполню как задачу\n"
         "• `/pr <задача>` — задача + открыть PR в develop\n"
+        "• `/fix [уточнение]` — прочитать замечания к открытому PR и выкатить правки в ту же ветку\n"
         "• `/cancel` — прервать текущую задачу",
         parse_mode="Markdown",
     )
@@ -298,7 +298,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
-    await run_job(update, update.message.text, open_pr=False)
+    await run_job(update, update.message.text, allow_gh=False)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -329,7 +329,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # показываем расшифровку и запускаем как обычную задачу (голос = без PR)
     await status.edit_text(f"🎙️ Распознал:\n«{text}»")
-    await run_job(update, text, open_pr=False)
+    await run_job(update, text, allow_gh=False)
 
 
 async def cmd_pr(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -339,7 +339,32 @@ async def cmd_pr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not task:
         await update.message.reply_text("Формат: `/pr <что сделать>`", parse_mode="Markdown")
         return
-    await run_job(update, task, open_pr=True)
+    prompt = task + "\n\nКогда всё готово и закоммичено — открой PR в develop."
+    await run_job(update, prompt, allow_gh=True)
+
+
+# Инструкция Nexus для итерации по уже открытому PR (режим /fix)
+ITERATION_PROMPT = (
+    "Это итерация по уже открытому pull request — пользователь оставил замечания в комментариях.\n"
+    "Действуй так:\n"
+    "1. Найди относящийся открытый PR: `gh pr list --state open` (если неоднозначно — самый свежий твой).\n"
+    "2. Прочитай ВСЕ замечания — и обсуждение PR (`gh pr view <n> --comments`), и инлайн-комментарии "
+    "ревью к строкам кода (`gh api repos/Tsezia/sweet_limit/pulls/<n>/comments`).\n"
+    "3. Переключись на ветку PR из origin: `git fetch origin && git checkout -B <branch> origin/<branch>`.\n"
+    "4. Внеси правки по замечаниям (делегируя Ванделю/Лине в их зонах), закоммить и запушь в ту же ветку — "
+    "PR обновится сам, новый создавать НЕ нужно.\n"
+    "5. В конце кратко отчитайся, что именно поправил по каждому замечанию."
+)
+
+
+async def cmd_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    extra = (update.message.text or "").partition(" ")[2].strip()
+    prompt = ITERATION_PROMPT
+    if extra:
+        prompt += f"\n\nДополнительное уточнение от пользователя: {extra}"
+    await run_job(update, prompt, allow_gh=True)
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -362,6 +387,7 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("pr", cmd_pr))
+    app.add_handler(CommandHandler("fix", cmd_fix))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
