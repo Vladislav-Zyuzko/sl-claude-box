@@ -50,6 +50,9 @@ COPY setup-toolchain.sh /usr/local/bin/setup-toolchain.sh
 COPY build-apk.sh /usr/local/bin/build-apk.sh
 RUN chmod +x /usr/local/bin/setup-toolchain.sh /usr/local/bin/build-apk.sh
 
+# Конфиг Dart MCP-сервера для Claude (подключается флагом --mcp-config)
+COPY dart-mcp.json /usr/local/etc/dart-mcp.json
+
 # Создаём пользователя для SSH
 RUN useradd -m -s /bin/bash claude-ssh && \
     mkdir -p /home/claude-ssh/.ssh && \

@@ -64,15 +64,25 @@ async def stream_task(prompt: str, allow_gh: bool):
       ("log",   str)   — строка не-JSON (например, вывод setup-repo.sh)
       ("end",   dict)  — {"exit": код, "stderr": текст}
     """
-    # allowlist git всегда; gh — только когда нужен PR / чтение PR (жёсткий гейт)
-    tools = '--allowedTools "Bash(git *)"'
+    # Базовый allowlist: git + тулчейн проекта (чтобы Nexus/сабагенты могли
+    # верифицировать работу — analyze/format/test/кодоген). gh — только под PR/fix.
+    allowed = [
+        "Bash(git *)",
+        "Bash(fvm *)",      # проект работает через fvm-обёртки (fvm flutter / fvm dart)
+        "Bash(flutter *)",
+        "Bash(dart *)",
+        "Bash(make *)",     # у проекта есть Makefile с хелперами (напр. make pg)
+        "mcp__dart",        # все инструменты Dart MCP-сервера, если он поднят в воркере
+    ]
     if allow_gh:
-        tools += ' "Bash(gh *)"'
+        allowed.append("Bash(gh *)")
+    tools = "--allowedTools " + " ".join(f'"{t}"' for t in allowed)
 
     inner = (
         f"cd {PROJECT_DIR} && "
         "setup-repo.sh 1>&2 && "
         "claude -p --output-format stream-json --verbose "
+        "--mcp-config /usr/local/etc/dart-mcp.json "
         f"--permission-mode acceptEdits {tools}"
     )
     # login-shell, чтобы подхватился /etc/profile.d/worker-env.sh с токенами
