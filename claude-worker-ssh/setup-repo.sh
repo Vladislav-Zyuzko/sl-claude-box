@@ -18,9 +18,11 @@ git config --global user.name  "${GIT_NAME}"
 git config --global user.email "${GIT_EMAIL}"
 git config --global --add safe.directory "${WORKDIR}"
 
-echo ">> gh auth (через токен)"
-echo "${GITHUB_TOKEN}" | gh auth login --with-token
-# делает gh credential-helper'ом для github.com -> токен не светится в remote URL
+# GITHUB_TOKEN уже в окружении — gh использует его автоматически.
+# `gh auth login --with-token` в этом случае ругается и падает (set -e),
+# поэтому логин пропускаем и только подключаем gh как git credential helper,
+# чтобы git clone/push по HTTPS шли с токеном (без него в remote URL).
+echo ">> gh auth: токен берётся из окружения GITHUB_TOKEN"
 gh auth setup-git
 
 if [ -d "${WORKDIR}/.git" ]; then

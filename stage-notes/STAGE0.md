@@ -17,8 +17,8 @@
 ## 1. Сборка и запуск воркера
 
 ```bash
-docker compose -f docker-compose.tg-bot.yml build claude-worker
-docker compose -f docker-compose.tg-bot.yml up -d claude-worker
+docker compose -f sl-docker-compose.yml build claude-worker
+docker compose -f sl-docker-compose.yml up -d claude-worker
 ```
 
 ## 2. Подтянуть sweet_limit внутрь воркера
@@ -75,11 +75,12 @@ docker exec -it claude-worker bash -lc '
 PR оставляем **на явную команду** (Этап 0 это только проверяет вручную из шага 3).
 
 ```bash
-docker exec -it claude-worker bash -lc '
-  cd /workspace/sweet_limit &&
-  claude -p "Создай ветку feature/stage0-demo от develop, добавь строку в README, \
-    закоммить и запушь ветку. PR не открывай." \
-    --permission-mode acceptEdits
+  docker exec -it claude-worker bash -lc '
+    cd /workspace/sweet_limit &&
+    claude -p "Создай ветку feature/stage0-demo от develop, добавь строку в    
+  README, закоммить и запушь ветку. Полсе этого открой PR." \
+      --permission-mode acceptEdits \
+      --allowedTools "Bash(git *)" "Bash(gh *)"
 '
 ```
 
