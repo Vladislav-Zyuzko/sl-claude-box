@@ -14,6 +14,7 @@ import json
 import time
 import asyncio
 import logging
+import tempfile
 from typing import List, Optional
 
 from telegram import Update
@@ -38,6 +39,9 @@ SSH_USER = os.environ.get("SSH_USER", "claude-ssh")
 SSH_KEY_PATH = os.environ.get("SSH_KEY_PATH", "/ssh-key")
 
 PROJECT_DIR = os.environ.get("SWEET_LIMIT_DIR", "/workspace/sweet_limit")
+
+# Модель распознавания речи (faster-whisper, локально). small — баланс точность/скорость на CPU.
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -245,6 +249,34 @@ async def run_job(update: Update, task_text: str, open_pr: bool):
     _running["task"] = asyncio.create_task(_execute(bot, chat_id, task_text, open_pr))
 
 
+# ===== РАСПОЗНАВАНИЕ ГОЛОСА (faster-whisper, локально на сервере) =====
+_whisper = {"model": None}
+_whisper_lock = asyncio.Lock()
+
+
+async def _ensure_whisper():
+    # ленивая инициализация с double-checked locking: грузим модель один раз
+    if _whisper["model"] is None:
+        async with _whisper_lock:
+            if _whisper["model"] is None:
+                from faster_whisper import WhisperModel
+                logger.info("Загружаю Whisper-модель '%s'…", WHISPER_MODEL)
+                _whisper["model"] = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    return _whisper["model"]
+
+
+async def transcribe_voice(path: str) -> str:
+    model = await _ensure_whisper()
+
+    def _run() -> str:
+        segments, _info = model.transcribe(path, language="ru")
+        return "".join(seg.text for seg in segments).strip()
+
+    # транскрипция CPU-bound — уводим в executor, чтобы не блокировать event loop
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _run)
+
+
 # ===== ХЕНДЛЕРЫ =====
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
@@ -256,6 +288,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Просто напиши задачу — Nexus реализует её в проекте sweet_limit, "
         "закоммитит и запушит ветку.\n\n"
         "• обычное сообщение — задача без PR\n"
+        "• 🎙️ голосовое — распознаю и выполню как задачу\n"
         "• `/pr <задача>` — задача + открыть PR в develop\n"
         "• `/cancel` — прервать текущую задачу",
         parse_mode="Markdown",
@@ -266,6 +299,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     await run_job(update, update.message.text, open_pr=False)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    status = await update.message.reply_text("🎙️ Распознаю голос…")
+    path = None
+    try:
+        tg_file = await update.message.voice.get_file()
+        with tempfile.NamedTemporaryFile(suffix=".oga", delete=False) as tmp:
+            path = tmp.name
+        await tg_file.download_to_drive(path)
+        text = await transcribe_voice(path)
+    except Exception as e:
+        logger.exception("Ошибка распознавания голоса")
+        await status.edit_text(f"💥 Не смог распознать голос: {str(e)[:300]}")
+        return
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    if not text:
+        await status.edit_text("🤷 Ничего не разобрал в записи.")
+        return
+
+    # показываем расшифровку и запускаем как обычную задачу (голос = без PR)
+    await status.edit_text(f"🎙️ Распознал:\n«{text}»")
+    await run_job(update, text, open_pr=False)
 
 
 async def cmd_pr(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -299,6 +363,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("pr", cmd_pr))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
