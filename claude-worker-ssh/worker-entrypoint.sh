@@ -32,5 +32,12 @@ chmod 600 "$ENV_FILE"
 
 echo ">> worker-env.sh собран ($(wc -l < "$ENV_FILE") переменных)"
 
+# Чекаут sweet_limit ведёт SSH-пользователь (бот заходит под ним), поэтому
+# именно он должен владеть /workspace. Иначе root-owned клон из ручных тестов
+# даёт "cd: Permission denied" и ломает git-операции под claude-ssh.
+mkdir -p /workspace
+chown -R "$SSH_USER":"$SSH_USER" /workspace 2>/dev/null || true
+echo ">> /workspace передан пользователю $SSH_USER"
+
 service ssh start
 exec tail -f /dev/null
