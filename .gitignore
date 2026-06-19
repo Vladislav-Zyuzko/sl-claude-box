@@ -1,0 +1,87 @@
+# ─────────────────────────────────────────────
+# Secrets & credentials  (NEVER commit these)
+# ─────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.env
+
+# SSH keys (private). Public *.pub keys are safe but we ignore them too by default.
+ssh-key
+ssh-key.pub
+.ssh/
+ssh-keys/*
+!ssh-keys/.gitkeep
+id_ed25519
+id_ed25519.pub
+id_rsa
+id_rsa*
+*.pem
+*.key
+
+# ─────────────────────────────────────────────
+# Runtime / mounted data
+# ─────────────────────────────────────────────
+workspace/*
+!workspace/.gitkeep
+
+# ─────────────────────────────────────────────
+# Python (tg-bot)
+# ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ─────────────────────────────────────────────
+# Docker
+# ─────────────────────────────────────────────
+docker-compose.override.yml
+*.local.yml
+
+# ─────────────────────────────────────────────
+# Logs
+# ─────────────────────────────────────────────
+*.log
+logs/
+
+# ─────────────────────────────────────────────
+# OS / Editor
+# ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
