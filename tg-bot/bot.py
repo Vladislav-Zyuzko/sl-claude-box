@@ -9,6 +9,7 @@ SLNexus Bot — Telegram → Claude Code (оркестратор Nexus) в claud
 """
 
 import os
+import re
 import html
 import json
 import time
@@ -40,6 +41,26 @@ SSH_KEY_PATH = os.environ.get("SSH_KEY_PATH", "/ssh-key")
 
 PROJECT_DIR = os.environ.get("SWEET_LIMIT_DIR", "/workspace/sweet_limit")
 
+# Каталог в воркере, куда складываем присланные фото/скрины.
+# Живут до явной /clearphotos — Nexus их НЕ удаляет.
+PHOTOS_DIR = os.environ.get("NEXUS_PHOTOS_DIR", "/tmp/nexus-uploads").rstrip("/")
+
+# В правилах permissions Claude Code одиночный ведущий "/" означает путь ОТ ИСТОЧНИКА
+# НАСТРОЕК, а не от корня ФС; абсолютный путь пишется с "//". Отсюда лишний слеш.
+PHOTOS_RULE = "/" + PHOTOS_DIR if PHOTOS_DIR.startswith("/") else PHOTOS_DIR
+
+
+def _ssh():
+    """Единое SSH-подключение к воркеру (одни параметры для всех операций)."""
+    return asyncssh.connect(
+        SSH_HOST,
+        port=SSH_PORT,
+        username=SSH_USER,
+        client_keys=[SSH_KEY_PATH],
+        known_hosts=None,
+        keepalive_interval=30,  # держим соединение живым на длинных задачах
+    )
+
 # Модель распознавания речи (faster-whisper, локально). small — баланс точность/скорость на CPU.
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
@@ -55,7 +76,8 @@ def is_allowed(user_id: int) -> bool:
 
 
 # ===== ЗАПУСК ЗАДАЧИ В ВОРКЕРЕ (SSH + stream-json) =====
-async def stream_task(prompt: str, allow_gh: bool):
+async def stream_task(prompt: str, allow_gh: bool, new_photos: Optional[List[str]] = None,
+                      resume_session: Optional[str] = None):
     """
     Асинхронный генератор. Подключается к воркеру по SSH, дёргает setup-repo.sh,
     затем запускает Claude headless со stream-json. Промпт отдаём в stdin,
@@ -63,9 +85,13 @@ async def stream_task(prompt: str, allow_gh: bool):
       ("event", dict)  — распарсенное событие stream-json
       ("log",   str)   — строка не-JSON (например, вывод setup-repo.sh)
       ("end",   dict)  — {"exit": код, "stderr": текст}
+
+    Фото из PHOTOS_DIR НЕ удаляются (живут до /clearphotos): к промпту лишь
+    подмешивается список приложенных/накопленных скринов.
     """
     # Базовый allowlist: git + тулчейн проекта (чтобы Nexus/сабагенты могли
     # верифицировать работу — analyze/format/test/кодоген). gh — только под PR/fix.
+    # Read папки с фото — всегда, чтобы Nexus мог открыть присланные скрины.
     allowed = [
         "Bash(git *)",
         "Bash(fvm *)",      # проект работает через fvm-обёртки (fvm flutter / fvm dart)
@@ -73,31 +99,41 @@ async def stream_task(prompt: str, allow_gh: bool):
         "Bash(dart *)",
         "Bash(make *)",     # у проекта есть Makefile с хелперами (напр. make pg)
         "mcp__dart",        # все инструменты Dart MCP-сервера, если он поднят в воркере
+        f"Read({PHOTOS_RULE}/**)",
     ]
     if allow_gh:
         allowed.append("Bash(gh *)")
     tools = "--allowedTools " + " ".join(f'"{t}"' for t in allowed)
 
+    # --resume <id> продолжает прежний диалог Nexus (память между сообщениями).
+    # Сессии Claude Code лежат в ~/.claude воркера, привязаны к cwd (PROJECT_DIR).
+    resume_flag = f"--resume {resume_session} " if resume_session else ""
+
     inner = (
         f"cd {PROJECT_DIR} && "
+        # --add-dir падает на несуществующем пути: гарантируем каталог до запуска
+        f"mkdir -p {PHOTOS_DIR} && "
         "setup-repo.sh 1>&2 && "
         "claude -p --output-format stream-json --verbose "
+        f"{resume_flag}"
+        # PHOTOS_DIR лежит вне cwd, а Claude читает только рабочий каталог и то,
+        # что явно добавлено --add-dir: без этого allowlist-правило не сработает.
+        f"--add-dir {PHOTOS_DIR} "
         "--mcp-config /usr/local/etc/dart-mcp.json "
         f"--permission-mode acceptEdits {tools}"
     )
     # login-shell, чтобы подхватился /etc/profile.d/worker-env.sh с токенами
     remote_cmd = f"bash -lc '{inner}'"
 
-    logger.info("SSH задача (gh=%s): %s", allow_gh, inner)
+    logger.info("SSH задача (gh=%s, photos=%s, resume=%s): %s",
+                allow_gh, bool(new_photos), bool(resume_session), inner)
 
-    async with asyncssh.connect(
-        SSH_HOST,
-        port=SSH_PORT,
-        username=SSH_USER,
-        client_keys=[SSH_KEY_PATH],
-        known_hosts=None,
-        keepalive_interval=30,  # держим соединение живым на длинных задачах
-    ) as conn:
+    async with _ssh() as conn:
+        # подмешиваем в промпт сведения о приложенных/накопленных фото
+        note = await _photos_prompt_note(conn, new_photos)
+        if note:
+            prompt = prompt + note
+
         proc = await conn.create_process(remote_cmd)
 
         # промпт задачи -> stdin
@@ -116,6 +152,86 @@ async def stream_task(prompt: str, allow_gh: bool):
         stderr_text = await proc.stderr.read()
         await proc.wait()
         yield ("end", {"exit": proc.exit_status, "stderr": stderr_text})
+
+
+# ===== ФОТО/СКРИНЫ: хранение в воркере и подмешивание в промпт =====
+def _safe_name(name: str) -> str:
+    """Безопасное имя файла: убираем путь, пробелы→'_', выкидываем спецсимволы."""
+    name = os.path.basename((name or "").strip()) or "photo.jpg"
+    name = re.sub(r"\s+", "_", name)
+    name = re.sub(r"[^\w.\-]", "", name)
+    return name or "photo.jpg"
+
+
+def _photo_index(name: str) -> int:
+    m = re.match(r"(\d+)-", name)
+    return int(m.group(1)) if m else 10 ** 9
+
+
+def _next_start_index(existing: List[str]) -> int:
+    """Максимальный номер среди уже лежащих 'N-...' файлов — для сквозной нумерации."""
+    mx = 0
+    for n in existing:
+        m = re.match(r"(\d+)-", n)
+        if m:
+            mx = max(mx, int(m.group(1)))
+    return mx
+
+
+async def _list_photos(conn) -> List[str]:
+    """Имена фото в PHOTOS_DIR воркера, отсортированы по номеру."""
+    try:
+        async with conn.start_sftp_client() as sftp:
+            names = [n for n in await sftp.listdir(PHOTOS_DIR) if not n.startswith(".")]
+    except Exception:
+        return []
+    return sorted(names, key=_photo_index)
+
+
+async def _photos_prompt_note(conn, new_photos: Optional[List[str]]) -> str:
+    """Приписка к промпту: какие фото приложены к ЭТОЙ задаче / накоплены ранее."""
+    if new_photos:
+        body = "\n".join(f"- {p}" for p in new_photos)
+        return (
+            "\n\nК этой задаче приложены фото — открой их инструментом Read "
+            f"и учитывай при выполнении:\n{body}"
+        )
+    names = await _list_photos(conn)
+    if names:
+        body = "\n".join(f"- {PHOTOS_DIR}/{n}" for n in names)
+        return (
+            "\n\nРанее присланные пользователем фото (номер — в начале имени). "
+            "Если задача ссылается на фото по номеру — открой нужный инструментом Read, "
+            f"иначе не обращай на них внимания:\n{body}"
+        )
+    return ""
+
+
+async def _store_photos(items: List[tuple]) -> List[str]:
+    """Заливает локальные файлы в PHOTOS_DIR воркера со сквозной нумерацией 'N-<имя>'.
+    items: [(local_path, original_name)]. Возвращает удалённые пути; локальные копии чистит."""
+    stored: List[str] = []
+    async with _ssh() as conn:
+        async with conn.start_sftp_client() as sftp:
+            try:
+                await sftp.makedirs(PHOTOS_DIR, exist_ok=True)
+            except Exception:
+                pass
+            try:
+                existing = [n for n in await sftp.listdir(PHOTOS_DIR) if not n.startswith(".")]
+            except Exception:
+                existing = []
+            idx = _next_start_index(existing)
+            for local, base in items:
+                idx += 1
+                remote = f"{PHOTOS_DIR}/{idx}-{_safe_name(base)}"
+                await sftp.put(local, remote)
+                stored.append(remote)
+                try:
+                    os.remove(local)
+                except OSError:
+                    pass
+    return stored
 
 
 # ===== ПЕРЕВОД СОБЫТИЙ stream-json В ЧЕЛОВЕЧЕСКИЕ ШАГИ =====
@@ -201,15 +317,31 @@ class Progress:
 # ===== JOB-МОДЕЛЬ (одна задача за раз) =====
 _running = {"task": None}  # type: ignore
 
+# Память диалога Nexus: chat_id -> session_id Claude Code (для --resume).
+# Сбрасывается командой /reset. Хранится в памяти бота — переживает задачи,
+# но не рестарт самого бота (сам транскрипт сессии живёт в ~/.claude воркера).
+_sessions: dict = {}
 
-async def _execute(bot, chat_id: int, prompt: str, allow_gh: bool):
+
+def _looks_like_stale_session(stderr: str) -> bool:
+    s = (stderr or "").lower()
+    return ("no conversation" in s or "session" in s and "found" in s
+            or "--resume" in s or "no such session" in s)
+
+
+async def _execute(bot, chat_id: int, prompt: str, allow_gh: bool, new_photos: Optional[List[str]] = None):
     prog = Progress(bot, chat_id)
     await prog.start()
     result: Optional[dict] = None
     stderr_tail = ""
+    resume = _sessions.get(chat_id)   # продолжаем прежний диалог Nexus, если он есть
+    session_id: Optional[str] = None
     try:
-        async for kind, payload in stream_task(prompt, allow_gh):
+        async for kind, payload in stream_task(prompt, allow_gh, new_photos, resume_session=resume):
             if kind == "event":
+                sid = payload.get("session_id")
+                if sid:
+                    session_id = sid  # запоминаем актуальный id для следующего хода
                 if payload.get("type") == "result":
                     result = payload
                 else:
@@ -224,11 +356,21 @@ async def _execute(bot, chat_id: int, prompt: str, allow_gh: bool):
         if result is not None:
             ok = not result.get("is_error")
             res_text = (result.get("result") or "").strip()
+            # сохраняем сессию на чат только при успехе — чтобы не тянуть сломанный контекст
+            if ok and session_id:
+                _sessions[chat_id] = session_id
             await prog.add("— финал —", force=True)
             await prog.final(f"{'✅ Готово' if ok else '❌ Ошибка'}\n\n{res_text or '(пустой ответ)'}")
         else:
+            # запуск не дошёл до result. Если резюмировали и воркер не нашёл сессию
+            # (например, был пересобран) — сбрасываем, чтобы следующее сообщение начало новый диалог.
+            stale = resume and _looks_like_stale_session(stderr_tail)
+            if stale:
+                _sessions.pop(chat_id, None)
             tail = f"\n\nstderr:\n{stderr_tail}" if stderr_tail else ""
-            await prog.final("⚠️ Задача завершилась без финального result-сообщения." + tail)
+            hint = ("\n\n♻️ Похоже, прежний контекст устарел — сбросил его. "
+                    "Повтори сообщение, оно начнёт новый диалог.") if stale else ""
+            await prog.final("⚠️ Задача завершилась без финального result-сообщения." + hint + tail)
 
     except asyncio.CancelledError:
         await prog.final("🛑 Задача отменена.")
@@ -283,6 +425,11 @@ async def _execute_build(bot, chat_id: int):
             async with conn.start_sftp_client() as sftp:
                 for remote in artifacts:
                     name = os.path.basename(remote)
+                    # уникальное имя для Telegram: app-release-a3f9k2.apk. Имя+размер
+                    # одинаковых сборок совпадали → телефон/Telegram считали файл тем же
+                    # и не ставили заново. 6-значный ключ делает каждую отправку уникальной.
+                    stem, ext = os.path.splitext(name)
+                    send_name = f"{stem}-{os.urandom(3).hex()}{ext}"
                     local = os.path.join(tempfile.gettempdir(), name)
                     await sftp.get(remote, local)
                     try:
@@ -291,13 +438,13 @@ async def _execute_build(bot, chat_id: int):
                             skipped += 1
                             await bot.send_message(
                                 chat_id,
-                                f"⚠️ {name} = {size // 1024 // 1024} МБ — больше лимита Telegram (50 МБ).\n"
+                                f"⚠️ {send_name} = {size // 1024 // 1024} МБ — больше лимита Telegram (50 МБ).\n"
                                 f"Артефакт на сервере: {remote}",
                             )
                         else:
                             sent += 1
                             with open(local, "rb") as fh:
-                                await bot.send_document(chat_id, document=fh, filename=name)
+                                await bot.send_document(chat_id, document=fh, filename=send_name)
                             # успешно отправили — убираем артефакт с сервера, чтобы не копился
                             try:
                                 await sftp.remove(remote)
@@ -327,21 +474,27 @@ async def _execute_build(bot, chat_id: int):
         await prog.final(f"💥 Ошибка сборки: {str(e)[:400]}")
 
 
-async def run_job(update: Update, prompt: str, allow_gh: bool):
+def _is_busy() -> bool:
+    t = _running.get("task")
+    return bool(t and not t.done())
+
+
+def _start_task(bot, chat_id: int, prompt: str, allow_gh: bool, new_photos: Optional[List[str]] = None):
+    _running["task"] = asyncio.create_task(_execute(bot, chat_id, prompt, allow_gh, new_photos))
+
+
+async def run_job(update: Update, prompt: str, allow_gh: bool, new_photos: Optional[List[str]] = None):
     if not prompt.strip():
         await update.message.reply_text("Пустая задача. Напиши, что нужно сделать.")
         return
 
-    t = _running.get("task")
-    if t and not t.done():
+    if _is_busy():
         await update.message.reply_text(
             "⚠️ Я ещё занят предыдущей задачей. Дождись её завершения или /cancel."
         )
         return
 
-    chat_id = update.effective_chat.id
-    bot = update.get_bot()
-    _running["task"] = asyncio.create_task(_execute(bot, chat_id, prompt, allow_gh))
+    _start_task(update.get_bot(), update.effective_chat.id, prompt, allow_gh, new_photos)
 
 
 # ===== РАСПОЗНАВАНИЕ ГОЛОСА (faster-whisper, локально на сервере) =====
@@ -381,12 +534,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "*SLNexus* на связи.\n\n"
         "Просто напиши задачу — Nexus реализует её в проекте sweet_limit, "
-        "закоммитит и запушит ветку.\n\n"
+        "закоммитит и запушит ветку. Контекст диалога он помнит между сообщениями "
+        "(не нужно повторять вводные каждый раз).\n\n"
         "• обычное сообщение — задача без PR\n"
         "• 🎙️ голосовое — распознаю и выполню как задачу\n"
+        "• 📷 фото (можно несколько/альбомом) — с подписью уйдут в задачу, без подписи просто сохранятся; ссылайся на них по номеру (`2-...`)\n"
+        "• 🖼️ скрин можно слать и файлом (без сжатия) — качество выше\n"
+        "• `/clearphotos` — очистить сохранённые фото\n"
         "• `/pr <задача>` — задача + открыть PR в develop\n"
         "• `/fix [уточнение]` — прочитать замечания к открытому PR и выкатить правки в ту же ветку\n"
         "• `/build` — собрать APK текущего состояния и прислать сюда\n"
+        "• `/reset` — забыть контекст диалога и начать с чистого листа\n"
         "• `/cancel` — прервать текущую задачу",
         parse_mode="Markdown",
     )
@@ -427,6 +585,124 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # показываем расшифровку и запускаем как обычную задачу (голос = без PR)
     await status.edit_text(f"🎙️ Распознал:\n«{text}»")
     await run_job(update, text, allow_gh=False)
+
+
+# Буфер для альбомов: Telegram шлёт фото media-группы отдельными апдейтами
+# (подпись обычно только у первого) — собираем их вместе с дебаунсом.
+_media_buffers: dict = {}  # media_group_id -> {items, caption, chat_id, timer}
+
+
+async def _process_photo_batch(bot, chat_id: int, items: List[tuple], caption: str):
+    """Сохраняет пачку фото в воркер; с подписью — запускает задачу, без подписи — просто складывает."""
+    try:
+        stored = await _store_photos(items)
+    except Exception as e:
+        logger.exception("Не смог сохранить фото")
+        for local, _ in items:
+            try:
+                os.remove(local)
+            except OSError:
+                pass
+        await bot.send_message(chat_id, f"💥 Не смог сохранить фото: {str(e)[:300]}")
+        return
+
+    listing = "\n".join(f"• {os.path.basename(p)}" for p in stored)
+    if not caption:
+        await bot.send_message(
+            chat_id,
+            f"📥 Сохранил {len(stored)} фото:\n{listing}\n\n"
+            "Сошлись на них по номеру в задаче. Очистить — /clearphotos.",
+        )
+        return
+
+    if _is_busy():
+        await bot.send_message(
+            chat_id,
+            f"📥 Сохранил {len(stored)} фото:\n{listing}\n\n"
+            "⏳ Сейчас занят другой задачей — пришли задачу текстом, когда освобожусь "
+            "(фото уже на месте, ссылайся по номеру).",
+        )
+        return
+
+    await bot.send_message(chat_id, f"📥 Принял {len(stored)} фото, отдаю Nexus’у.")
+    _start_task(bot, chat_id, caption, allow_gh=False, new_photos=stored)
+
+
+async def _flush_media_group(mgid: str, bot):
+    try:
+        await asyncio.sleep(1.5)  # ждём, пока приедут все фото альбома
+    except asyncio.CancelledError:
+        return
+    buf = _media_buffers.pop(mgid, None)
+    if buf:
+        await _process_photo_batch(bot, buf["chat_id"], buf["items"], buf["caption"])
+
+
+async def _ingest_photo(update: Update, local_path: str, base_name: str):
+    """Маршрутизация: одиночное фото — сразу, альбом — через буфер с дебаунсом."""
+    msg = update.message
+    caption = (msg.caption or "").strip()
+    mgid = msg.media_group_id
+    if not mgid:
+        await _process_photo_batch(update.get_bot(), msg.chat_id, [(local_path, base_name)], caption)
+        return
+    buf = _media_buffers.get(mgid)
+    if buf is None:
+        buf = {"items": [], "caption": "", "chat_id": msg.chat_id, "timer": None}
+        _media_buffers[mgid] = buf
+    buf["items"].append((local_path, base_name))
+    if caption:
+        buf["caption"] = caption
+    if buf["timer"]:
+        buf["timer"].cancel()
+    buf["timer"] = asyncio.create_task(_flush_media_group(mgid, update.get_bot()))
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    # качаем самый крупный вариант фото во временный файл бота
+    path = None
+    try:
+        photo = update.message.photo[-1]
+        tg_file = await photo.get_file()
+        fd, path = tempfile.mkstemp(suffix=".jpg")
+        os.close(fd)
+        await tg_file.download_to_drive(path)
+    except Exception as e:
+        logger.exception("Не смог скачать фото")
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        await update.message.reply_text(f"💥 Не смог принять фото: {str(e)[:300]}")
+        return
+    await _ingest_photo(update, path, "photo.jpg")
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Скрин, присланный файлом (без сжатия) — сохраняем под исходным именем."""
+    if not is_allowed(update.effective_user.id):
+        return
+    doc = update.message.document
+    path = None
+    try:
+        tg_file = await doc.get_file()
+        suffix = os.path.splitext(doc.file_name or "")[1] or ".png"
+        fd, path = tempfile.mkstemp(suffix=suffix)
+        os.close(fd)
+        await tg_file.download_to_drive(path)
+    except Exception as e:
+        logger.exception("Не смог скачать документ-картинку")
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        await update.message.reply_text(f"💥 Не смог принять файл: {str(e)[:300]}")
+        return
+    await _ingest_photo(update, path, doc.file_name or "image.png")
 
 
 async def cmd_pr(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -475,6 +751,16 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сейчас нечего отменять.")
 
 
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    had = _sessions.pop(update.effective_chat.id, None)
+    await update.message.reply_text(
+        "🧹 Контекст диалога сброшен — следующее сообщение начнёт новый."
+        if had else "Контекст и так пуст — диалог уже новый."
+    )
+
+
 async def cmd_build(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
@@ -485,6 +771,30 @@ async def cmd_build(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     bot = update.get_bot()
     _running["task"] = asyncio.create_task(_execute_build(bot, chat_id))
+
+
+async def cmd_clearphotos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    try:
+        async with _ssh() as conn:
+            async with conn.start_sftp_client() as sftp:
+                try:
+                    names = [n for n in await sftp.listdir(PHOTOS_DIR) if not n.startswith(".")]
+                except Exception:
+                    names = []
+                for n in names:
+                    try:
+                        await sftp.remove(f"{PHOTOS_DIR}/{n}")
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.exception("clearphotos failed")
+        await update.message.reply_text(f"💥 Не смог почистить: {str(e)[:300]}")
+        return
+    await update.message.reply_text(
+        f"🧹 Удалил {len(names)} фото." if names else "📭 Сохранённых фото нет."
+    )
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -498,8 +808,12 @@ def main():
     app.add_handler(CommandHandler("pr", cmd_pr))
     app.add_handler(CommandHandler("fix", cmd_fix))
     app.add_handler(CommandHandler("build", cmd_build))
+    app.add_handler(CommandHandler("clearphotos", cmd_clearphotos))
+    app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 

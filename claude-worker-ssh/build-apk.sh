@@ -30,17 +30,21 @@ TARGET="${BUILD_TARGET:-lib/main_prod.dart}"
 # release: меньше debug в 2-3 раза и влезает в лимит Telegram; подпись — debug-ключами
 # (signingConfig signingConfigs.debug в build.gradle), keystore не нужен. Тумблер BUILD_MODE.
 MODE="${BUILD_MODE:-release}"
+# Собираем ТОЛЬКО arm64-v8a (реальные устройства) одним APK. Раньше был
+# --split-per-abi: он делал 3 APK (arm64/armeabi-v7a/x86_64), а бот шлёт и удаляет
+# лишь arm64 — два оставшихся ABI копились в build/. Один target-platform = один
+# файл, его и отправляем/чистим, хвостов нет. Другой ABI — через BUILD_ABI.
+ABI="${BUILD_ABI:-android-arm64}"
 OUT="$PROJECT/build/app/outputs/flutter-apk"
 
-# чистим APK прошлых сборок, чтобы они не копились на сервере (остаётся только текущая)
+# чистим ВСЕ apk прошлых сборок (в т.ч. лишние ABI от старых split-сборок), чтобы не копились
 rm -f "$OUT"/*.apk 2>/dev/null || true
 
-echo ">> flutter build apk ($MODE, split-per-abi, target=$TARGET)"
-fvm flutter build apk --"$MODE" --split-per-abi --target "$TARGET"
+echo ">> flutter build apk ($MODE, $ABI, target=$TARGET)"
+fvm flutter build apk --"$MODE" --target-platform "$ABI" --target "$TARGET"
 
-# Отдаём arm64-v8a (реальные устройства). Если нужен другой ABI — поправить тут.
-for f in "$OUT"/app-arm64-v8a-"$MODE".apk; do
-  if [ -f "$f" ]; then
-    echo "ARTIFACT:$f"
-  fi
-done
+# single-ABI сборка (без --split-per-abi) кладёт файл как app-$MODE.apk
+APK="$OUT/app-$MODE.apk"
+if [ -f "$APK" ]; then
+  echo "ARTIFACT:$APK"
+fi
