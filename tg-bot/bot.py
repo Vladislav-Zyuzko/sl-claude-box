@@ -18,7 +18,7 @@ import logging
 import tempfile
 from typing import List, Optional
 
-from telegram import Update
+from telegram import Update, BotCommand, BotCommandScopeChat
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 import asyncssh
@@ -545,7 +545,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/fix [уточнение]` — прочитать замечания к открытому PR и выкатить правки в ту же ветку\n"
         "• `/build` — собрать APK текущего состояния и прислать сюда\n"
         "• `/reset` — забыть контекст диалога и начать с чистого листа\n"
-        "• `/cancel` — прервать текущую задачу",
+        "• `/cancel` — прервать текущую задачу\n"
+        "• `/help` — эта справка",
         parse_mode="Markdown",
     )
 
@@ -802,9 +803,31 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ===== ЗАПУСК =====
+# Меню команд (кнопка «Меню» и автодополнение по «/») — видно только разрешённым пользователям
+BOT_COMMANDS = [
+    BotCommand("pr", "Задача + открыть PR в develop"),
+    BotCommand("fix", "Поправить открытый PR по замечаниям"),
+    BotCommand("build", "Собрать APK и прислать сюда"),
+    BotCommand("reset", "Сбросить контекст диалога"),
+    BotCommand("cancel", "Прервать текущую задачу"),
+    BotCommand("clearphotos", "Удалить сохранённые фото"),
+    BotCommand("help", "Справка по боту"),
+]
+
+
+async def post_init(app: Application):
+    for uid in ALLOWED_USER_IDS:
+        try:
+            await app.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeChat(uid))
+        except Exception as e:
+            # Например, пользователь ещё ни разу не писал боту — чата нет
+            logger.warning("Не смог выставить меню команд для %s: %s", uid, e)
+
+
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("pr", cmd_pr))
     app.add_handler(CommandHandler("fix", cmd_fix))
     app.add_handler(CommandHandler("build", cmd_build))
