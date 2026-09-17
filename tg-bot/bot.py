@@ -67,6 +67,28 @@ def _ssh():
         keepalive_interval=30,  # держим соединение живым на длинных задачах
     )
 
+
+async def _worker_run(cmd: str, timeout: float = 120):
+    """Короткая служебная команда в воркере (login-shell) -> (exit, stdout, stderr)."""
+    async with _ssh() as conn:
+        res = await asyncio.wait_for(conn.run(f"bash -lc '{cmd}'", check=False), timeout)
+    return res.exit_status, res.stdout or "", res.stderr or ""
+
+
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
+
+
+async def _bind_session(session_id: Optional[str], active: bool = True):
+    """Пишем в state воркера, какому диалогу принадлежит рабочее дерево (для автосейва и /restore)."""
+    sid = session_id if session_id and _SESSION_ID_RE.match(session_id) else "-"
+    try:
+        code, _, err = await _worker_run(f"nexus-state set-current {sid} {1 if active else 0}")
+        if code:
+            logger.warning("nexus-state set-current exit=%s: %s", code, err[-300:])
+    except Exception:
+        logger.exception("Не смог обновить nexus-state")
+
+
 # Модель распознавания речи (faster-whisper, локально). small — баланс точность/скорость на CPU.
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
@@ -114,12 +136,15 @@ async def stream_task(prompt: str, allow_gh: bool, new_photos: Optional[List[str
     # --resume <id> продолжает прежний диалог Nexus (память между сообщениями).
     # Сессии Claude Code лежат в ~/.claude воркера, привязаны к cwd (PROJECT_DIR).
     resume_flag = f"--resume {resume_session} " if resume_session else ""
+    # Политика дерева (см. setup-repo.sh): с --session — продолжаем на ветке диалога,
+    # без неё — новый диалог: autosave и чистый develop.
+    setup_flag = f"--session {resume_session} " if resume_session else ""
 
     inner = (
         f"cd {PROJECT_DIR} && "
         # --add-dir падает на несуществующем пути: гарантируем каталог до запуска
         f"mkdir -p {PHOTOS_DIR} && "
-        "setup-repo.sh 1>&2 && "
+        f"setup-repo.sh {setup_flag}1>&2 && "
         "claude -p --output-format stream-json --verbose "
         f"{resume_flag}"
         # PHOTOS_DIR лежит вне cwd, а Claude читает только рабочий каталог и то,
@@ -365,17 +390,29 @@ async def _execute(bot, chat_id: int, prompt: str, allow_gh: bool, new_photos: O
             # сохраняем сессию на чат только при успехе — чтобы не тянуть сломанный контекст
             if ok and session_id:
                 _sessions[chat_id] = session_id
+                await _bind_session(session_id)
             await prog.add("— финал —", force=True)
             await prog.final(f"{'✅ Готово' if ok else '❌ Ошибка'}\n\n{res_text or '(пустой ответ)'}")
+        elif resume and "NEXUS_SESSION_MISMATCH" in stderr_tail:
+            # Дерево уже не этого диалога: воркер перезапускался (работа ушла в автосейв,
+            # сейчас develop). Молча продолжать на develop нельзя — сообщаем и забываем сессию.
+            _sessions.pop(chat_id, None)
+            await prog.final(
+                "♻️ Воркер перезапускался: прошлая работа сохранена в автосейв, сейчас develop.\n\n"
+                "/restore — вернуться к ней и продолжить диалог\n"
+                "или повтори сообщение — начнётся новый диалог с develop."
+            )
         else:
             # запуск не дошёл до result. Если резюмировали и воркер не нашёл сессию
             # (например, был пересобран) — сбрасываем, чтобы следующее сообщение начало новый диалог.
             stale = resume and _looks_like_stale_session(stderr_tail)
             if stale:
                 _sessions.pop(chat_id, None)
+                # дерево остаётся за диалогом (без сессии) — следующее сообщение продолжит на той же ветке
+                await _bind_session(None)
             tail = f"\n\nstderr:\n{stderr_tail}" if stderr_tail else ""
             hint = ("\n\n♻️ Похоже, прежний контекст устарел — сбросил его. "
-                    "Повтори сообщение, оно начнёт новый диалог.") if stale else ""
+                    "Повтори сообщение: диалог начнётся заново, но на той же ветке.") if stale else ""
             await prog.final("⚠️ Задача завершилась без финального result-сообщения." + hint + tail)
 
     except asyncio.CancelledError:
@@ -590,7 +627,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/pr <задача>` — задача + открыть PR в develop\n"
         "• `/fix [уточнение]` — прочитать замечания к открытому PR и выкатить правки в ту же ветку\n"
         "• `/build` — собрать APK текущего состояния и прислать сюда\n"
-        "• `/reset` — забыть контекст диалога и начать с чистого листа\n"
+        "• `/reset` — забыть контекст диалога; новый диалог начнётся с develop (работа уйдёт в автосейв)\n"
+        "• `/restore` — вернуть прошлую работу: ветку, незакоммиченные правки и контекст диалога\n"
         "• `/cancel` — прервать текущую задачу\n"
         "• `/help` — эта справка",
         parse_mode="Markdown",
@@ -801,11 +839,79 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
+    if _is_busy():
+        await update.message.reply_text("⚠️ Я ещё занят задачей. Дождись её или /cancel.")
+        return
     had = _sessions.pop(update.effective_chat.id, None)
+    try:
+        await _worker_run("nexus-state deactivate")
+    except Exception:
+        logger.exception("nexus-state deactivate failed")
     await update.message.reply_text(
-        "🧹 Контекст диалога сброшен — следующее сообщение начнёт новый."
-        if had else "Контекст и так пуст — диалог уже новый."
+        ("🧹 Контекст диалога сброшен." if had else "Контекст и так пуст.")
+        + " Следующее сообщение начнёт новый диалог с develop, "
+          "текущая работа уйдёт в автосейв (/restore вернёт)."
     )
+
+
+async def _execute_restore(bot, chat_id: int):
+    msg = await bot.send_message(chat_id, "♻️ Восстанавливаю прошлую работу…")
+    try:
+        code, out, err = await _worker_run("restore-repo.sh", timeout=300)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception("restore failed")
+        await bot.send_message(chat_id, f"💥 Не смог восстановить: {str(e)[:400]}")
+        return
+    if code:
+        await bot.send_message(chat_id, f"❌ restore-repo.sh упал (exit {code}).\n\n{err[-1200:]}")
+        return
+
+    info = {}
+    notes = []
+    for line in out.splitlines():
+        key, sep, val = line.partition(":")
+        if not sep:
+            key = line
+        if key == "RESTORE_NOTE":
+            notes.append(val)
+        elif key.startswith("RESTORE"):
+            info[key] = val.strip()
+
+    if "RESTORE_NONE" in info:
+        await bot.edit_message_text("📭 Восстанавливать нечего — автосейвов нет.", chat_id, msg.message_id)
+        return
+
+    session = info.get("RESTORED_SESSION") or None
+    if session:
+        _sessions[chat_id] = session
+    else:
+        _sessions.pop(chat_id, None)
+
+    branch = html.escape(info.get("RESTORED_BRANCH", "?"))
+    source = info.get("RESTORED_FROM", "")
+    stash = info.get("RESTORED_STASH", "none")
+    lines = [f"✅ Ветка <code>{branch}</code>"
+             + (" (текущее дерево)" if source == "current" else f", автосейв от {html.escape(source)}")]
+    if stash == "applied":
+        lines.append("• незакоммиченные правки возвращены")
+    elif stash.startswith("conflict:"):
+        lines.append("⚠️ правки не наложились чисто — они целы в stash "
+                     f"<code>{html.escape(stash.partition(':')[2][:12])}</code>, попроси Nexus применить их")
+    lines.append("• контекст диалога восстановлен" if session
+                 else "• контекста диалога нет — следующее сообщение начнёт новый, но на этой ветке")
+    lines += [f"• {html.escape(n)}" for n in notes]
+    await bot.edit_message_text("\n".join(lines), chat_id, msg.message_id, parse_mode="HTML")
+
+
+async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    if _is_busy():
+        await update.message.reply_text("⚠️ Я ещё занят задачей. Дождись её или /cancel.")
+        return
+    _running["task"] = asyncio.create_task(_execute_restore(update.get_bot(), update.effective_chat.id))
 
 
 async def cmd_build(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -855,13 +961,67 @@ BOT_COMMANDS = [
     BotCommand("fix", "Поправить открытый PR по замечаниям"),
     BotCommand("build", "Собрать APK и прислать сюда"),
     BotCommand("reset", "Сбросить контекст диалога"),
+    BotCommand("restore", "Вернуть прошлую работу (ветка + правки + диалог)"),
     BotCommand("cancel", "Прервать текущую задачу"),
     BotCommand("clearphotos", "Удалить сохранённые фото"),
     BotCommand("help", "Справка по боту"),
 ]
 
 
+async def _startup_notice(bot):
+    """После старта подсвечиваем несохранённую работу. Воркер может подниматься дольше
+    бота (entrypoint делает autosave до старта sshd) — поэтому ретраим."""
+    status = None
+    for _ in range(30):
+        try:
+            code, out, _ = await _worker_run("repo-status.sh", timeout=60)
+            if code == 0:
+                status = out
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(10)
+    if status is None:
+        logger.warning("Воркер недоступен — уведомление о состоянии не отправлено")
+        return
+
+    info = {}
+    for line in status.splitlines():
+        key, _, val = line.partition(":")
+        info[key] = val
+    branch = html.escape(info.get("STATUS_BRANCH", "?"))
+    dirty = info.get("STATUS_DIRTY", "0").strip()
+
+    if info.get("STATUS_ACTIVE") == "1":
+        # перезапустился только бот: дерево по-прежнему за диалогом
+        text = (f"♻️ Я перезапустился. Рабочее дерево на ветке <code>{branch}</code>"
+                f" (изменённых файлов: {dirty}).\n\n"
+                "/restore — продолжить этот диалог\n"
+                "новое сообщение — новый диалог с develop (работа уйдёт в автосейв)")
+    elif "PENDING" in info:
+        p_branch, _, rest = info["PENDING"].partition("\t")
+        saved_at, _, stash = rest.partition("\t")
+        changes = "с незакоммиченными правками" if stash.strip() not in ("", "-") else "без незакоммиченных правок"
+        text = (f"⚠️ Работаю от <code>{branch}</code>. Есть несохранённая прошлая работа: "
+                f"ветка <code>{html.escape(p_branch)}</code>, {changes} (автосейв от {html.escape(saved_at)}).\n\n"
+                "/restore — вернуться к ней")
+    else:
+        return
+
+    for uid in ALLOWED_USER_IDS:
+        try:
+            await bot.send_message(uid, text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning("Не смог отправить уведомление о состоянии %s: %s", uid, e)
+
+
+_background = set()  # держим ссылки на фоновые задачи, иначе их может собрать GC
+
+
 async def post_init(app: Application):
+    t = asyncio.create_task(_startup_notice(app.bot))
+    _background.add(t)
+    t.add_done_callback(_background.discard)
     for uid in ALLOWED_USER_IDS:
         try:
             await app.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeChat(uid))
@@ -879,6 +1039,7 @@ def main():
     app.add_handler(CommandHandler("build", cmd_build))
     app.add_handler(CommandHandler("clearphotos", cmd_clearphotos))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("restore", cmd_restore))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))

@@ -16,6 +16,7 @@ services:
       - ./workspace:/workspace
       - ./ssh-key.pub:/home/claude-ssh/.ssh/authorized_keys:ro
       - toolchain:/opt/toolchain          # Android SDK + Flutter + кэши (persistent)
+      - claude-home:/home/claude-ssh/.claude   # транскрипты сессий Claude (для /restore)
     restart: unless-stopped
 
   telegram-bot:
@@ -41,3 +42,4 @@ services:
 
 volumes:
   toolchain:
+  claude-home:

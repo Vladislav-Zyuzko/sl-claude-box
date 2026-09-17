@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Служебный state чекаута sweet_limit: текущий диалог + история автосейвов.
+
+Файл лежит в .git/nexus-state.json: не коммитится и переживает `git clean -fd`.
+
+  current  — чей сейчас рабочий каталог: {session_id, active}. active=true значит
+             «дерево принадлежит идущему диалогу, сбрасывать нельзя».
+  saves    — автосейвы (новые первыми, не больше MAX_SAVES):
+             {id, branch, head, stash, session_id, saved_at, restored}
+
+Команды. Вывод — поля через таб, их парсят bash-скрипты. Пустое поле печатается
+как "-": иначе bash-овый read с IFS=таб склеил бы соседние разделители.
+  get-current                          -> session_id, active(0|1)
+  set-current <session_id|-> <0|1>
+  deactivate                           — дерево больше не за диалогом (session_id сохраняем для автосейва)
+  add-save <branch|-> <head> <stash|-> <session_id|->   -> stash-sha вытесненных записей (по строке)
+  pending                              -> id, branch, head, stash, session_id, saved_at (или пусто)
+  mark-restored <id>
+"""
+import json
+import os
+import sys
+import tempfile
+import time
+
+MAX_SAVES = 5
+PROJECT = os.environ.get("SWEET_LIMIT_DIR", "/workspace/sweet_limit")
+STATE = os.path.join(PROJECT, ".git", "nexus-state.json")
+
+
+def load():
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    data.setdefault("current", {"session_id": "", "active": False})
+    data.setdefault("saves", [])
+    return data
+
+
+def save(data):
+    # атомарно: пишем во временный файл рядом и переименовываем
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE), prefix=".nexus-state.")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE)
+
+
+def undash(v):
+    return "" if v in (None, "-") else v
+
+
+def fields(*values):
+    return "\t".join(v or "-" for v in values)
+
+
+def main(argv):
+    if not argv:
+        print(__doc__, file=sys.stderr)
+        return 2
+    cmd, args = argv[0], argv[1:]
+    data = load()
+
+    if cmd == "get-current":
+        cur = data["current"]
+        print(fields(cur.get("session_id"), "1" if cur.get("active") else "0"))
+    elif cmd == "set-current":
+        data["current"] = {"session_id": undash(args[0]), "active": args[1] == "1"}
+        save(data)
+    elif cmd == "deactivate":
+        data["current"]["active"] = False
+        save(data)
+    elif cmd == "add-save":
+        branch, head, stash, session = (undash(a) for a in args[:4])
+        entry = {
+            "id": f"{int(time.time())}-{head[:7]}",
+            "branch": branch,
+            "head": head,
+            "stash": stash,
+            "session_id": session,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()),
+            "restored": False,
+        }
+        saves = [entry] + data["saves"]
+        data["saves"], dropped = saves[:MAX_SAVES], saves[MAX_SAVES:]
+        save(data)
+        # вытесненные из истории stash больше не нужны — скрипт их дропнет
+        for d in dropped:
+            if d.get("stash") and not d.get("restored"):
+                print(d["stash"])
+    elif cmd == "pending":
+        for s in data["saves"]:
+            if not s.get("restored"):
+                print(fields(s["id"], s["branch"], s["head"], s["stash"],
+                             s["session_id"], s["saved_at"]))
+                break
+    elif cmd == "mark-restored":
+        for s in data["saves"]:
+            if s["id"] == args[0]:
+                s["restored"] = True
+        save(data)
+    else:
+        print(f"unknown command: {cmd}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

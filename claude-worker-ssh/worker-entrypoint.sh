@@ -44,5 +44,21 @@ echo ">> /workspace передан пользователю $SSH_USER"
 mkdir -p /opt/toolchain
 chown "$SSH_USER":"$SSH_USER" /opt/toolchain 2>/dev/null || true
 
+# ~/.claude (транскрипты сессий для --resume) живёт в volume, чтобы /restore
+# возвращал и диалог. Свежий named volume монтируется root-owned — отдаём пользователю.
+mkdir -p "/home/$SSH_USER/.claude"
+chown "$SSH_USER":"$SSH_USER" "/home/$SSH_USER/.claude" 2>/dev/null || true
+
+# Рабочее дерево после (пере)запуска: прошлая работа уходит в автосейв, стартуем
+# с чистого BASE_BRANCH. Бот подсветит автосейв, вернуть — /restore.
+PROJECT="${SWEET_LIMIT_DIR:-/workspace/sweet_limit}"
+# git, убитый посреди операции (down во время задачи), оставляет lock и блокирует всё
+rm -f "$PROJECT/.git/index.lock"
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+  # login-shell: подхватывает worker-env.sh с токенами и PATH из profile.d
+  su -l "$SSH_USER" -c 'setup-repo.sh --startup' \
+    || echo ">> WARN: setup-repo.sh --startup упал — дерево не сброшено, см. лог выше"
+fi
+
 service ssh start
 exec tail -f /dev/null

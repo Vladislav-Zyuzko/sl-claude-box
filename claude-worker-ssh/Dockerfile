@@ -19,6 +19,14 @@ RUN apt-get update && apt-get install -y openssh-server curl gpg && \
 COPY setup-repo.sh /usr/local/bin/setup-repo.sh
 RUN chmod +x /usr/local/bin/setup-repo.sh
 
+# Автосейв/восстановление рабочего дерева (/restore в боте) + state в .git/nexus-state.json
+COPY nexus-git.sh /usr/local/lib/nexus-git.sh
+COPY nexus-state /usr/local/bin/nexus-state
+COPY restore-repo.sh /usr/local/bin/restore-repo.sh
+COPY repo-status.sh /usr/local/bin/repo-status.sh
+RUN chmod 644 /usr/local/lib/nexus-git.sh && \
+    chmod +x /usr/local/bin/nexus-state /usr/local/bin/restore-repo.sh /usr/local/bin/repo-status.sh
+
 # Entrypoint: прокидывает env контейнера в SSH-сессии через /etc/profile.d
 COPY worker-entrypoint.sh /usr/local/bin/worker-entrypoint.sh
 RUN chmod +x /usr/local/bin/worker-entrypoint.sh
