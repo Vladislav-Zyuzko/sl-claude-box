@@ -19,6 +19,7 @@ import tempfile
 from typing import List, Optional
 
 from telegram import Update, BotCommand, BotCommandScopeChat
+from telegram.error import TimedOut
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 import asyncssh
@@ -48,6 +49,11 @@ PHOTOS_DIR = os.environ.get("NEXUS_PHOTOS_DIR", "/tmp/nexus-uploads").rstrip("/"
 # В правилах permissions Claude Code одиночный ведущий "/" означает путь ОТ ИСТОЧНИКА
 # НАСТРОЕК, а не от корня ФС; абсолютный путь пишется с "//". Отсюда лишний слеш.
 PHOTOS_RULE = "/" + PHOTOS_DIR if PHOTOS_DIR.startswith("/") else PHOTOS_DIR
+
+# Таймауты отправки APK в Telegram (сек). Дефолты PTB — write 20 / read 5: ~27 МБ не успевали
+# уйти или Telegram не успевал ответить → TimedOut, хотя файл иногда всё же доходил.
+UPLOAD_WRITE_TIMEOUT = float(os.environ.get("UPLOAD_WRITE_TIMEOUT", "300"))
+UPLOAD_READ_TIMEOUT = float(os.environ.get("UPLOAD_READ_TIMEOUT", "120"))
 
 
 def _ssh():
@@ -399,20 +405,38 @@ async def _execute_build(bot, chat_id: int):
             keepalive_interval=30,
         ) as conn:
             proc = await conn.create_process(remote_cmd)
-            async for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("ARTIFACT:"):
-                    artifacts.append(line[len("ARTIFACT:"):])
-                else:
-                    await prog.add(f"🔨 {line[:80]}")
 
-            stderr_text = await proc.stderr.read()
+            # stderr читаем параллельно со stdout: иначе при большом stderr (setup-toolchain,
+            # warnings gradle) буфер SSH-канала переполняется, удалённый процесс блокируется
+            # на записи и stdout не закрывается — /build виснет. Держим только хвост для отчёта.
+            stderr_tail = ""
+
+            async def _drain_stderr():
+                nonlocal stderr_tail
+                while True:
+                    chunk = await proc.stderr.read(65536)
+                    if not chunk:
+                        break
+                    stderr_tail = (stderr_tail + chunk)[-1200:]
+
+            stderr_task = asyncio.create_task(_drain_stderr())
+            try:
+                async for line in proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("ARTIFACT:"):
+                        artifacts.append(line[len("ARTIFACT:"):])
+                    else:
+                        await prog.add(f"🔨 {line[:80]}")
+                await stderr_task
+            finally:
+                if not stderr_task.done():
+                    stderr_task.cancel()
             await proc.wait()
 
             if proc.exit_status:
-                await prog.final(f"❌ Сборка упала (exit {proc.exit_status}).\n\n{(stderr_text or '')[-1200:]}")
+                await prog.final(f"❌ Сборка упала (exit {proc.exit_status}).\n\n{stderr_tail}")
                 return
             if not artifacts:
                 await prog.final("⚠️ Сборка прошла, но APK не найден.")
@@ -422,6 +446,7 @@ async def _execute_build(bot, chat_id: int):
             await prog.add("📦 Забираю APK…", force=True)
             sent = 0
             skipped = 0
+            unconfirmed = 0
             async with conn.start_sftp_client() as sftp:
                 for remote in artifacts:
                     name = os.path.basename(remote)
@@ -442,9 +467,25 @@ async def _execute_build(bot, chat_id: int):
                                 f"Артефакт на сервере: {remote}",
                             )
                         else:
+                            try:
+                                with open(local, "rb") as fh:
+                                    await bot.send_document(
+                                        chat_id, document=fh, filename=send_name,
+                                        write_timeout=UPLOAD_WRITE_TIMEOUT,
+                                        read_timeout=UPLOAD_READ_TIMEOUT,
+                                    )
+                            except TimedOut:
+                                # Не повторяем: при таймауте на чтении ответа Telegram мог уже
+                                # принять файл — повтор дал бы дубль. Артефакт оставляем на сервере.
+                                logger.warning("Таймаут отправки %s", send_name)
+                                unconfirmed += 1
+                                await bot.send_message(
+                                    chat_id,
+                                    f"⏱ Отправка {send_name} не подтвердилась (таймаут Telegram), "
+                                    f"файл может прийти чуть позже.\nАртефакт на сервере: {remote}",
+                                )
+                                continue
                             sent += 1
-                            with open(local, "rb") as fh:
-                                await bot.send_document(chat_id, document=fh, filename=send_name)
                             # успешно отправили — убираем артефакт с сервера, чтобы не копился
                             try:
                                 await sftp.remove(remote)
@@ -456,10 +497,15 @@ async def _execute_build(bot, chat_id: int):
                         except OSError:
                             pass
 
-            if sent and not skipped:
+            if sent and not skipped and not unconfirmed:
                 await prog.final("✅ Сборка готова, APK отправлен.")
-            elif sent and skipped:
-                await prog.final(f"✅ Сборка готова. Отправлено: {sent}, пропущено по размеру: {skipped} (путь выше).")
+            elif unconfirmed and not sent and not skipped:
+                await prog.final("✅ Сборка готова, но отправка APK не подтвердилась — путь на сервере выше.")
+            elif sent or unconfirmed:
+                await prog.final(
+                    f"✅ Сборка готова. Отправлено: {sent}, не подтверждено: {unconfirmed}, "
+                    f"пропущено по размеру: {skipped} (пути выше)."
+                )
             else:
                 await prog.final("✅ Сборка готова, но APK не влез в лимит Telegram — путь на сервере выше.")
 
