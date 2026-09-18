@@ -7,6 +7,7 @@
              «дерево принадлежит идущему диалогу, сбрасывать нельзя».
   saves    — автосейвы (новые первыми, не больше MAX_SAVES):
              {id, branch, head, stash, session_id, saved_at, restored}
+  pins     — chat_id -> message_id закреплённой в Telegram шапки состояния
 
 Команды. Вывод — поля через таб, их парсят bash-скрипты. Пустое поле печатается
 как "-": иначе bash-овый read с IFS=таб склеил бы соседние разделители.
@@ -16,6 +17,8 @@
   add-save <branch|-> <head> <stash|-> <session_id|->   -> stash-sha вытесненных записей (по строке)
   pending                              -> id, branch, head, stash, session_id, saved_at (или пусто)
   mark-restored <id>
+  get-pin <chat_id>                    -> message_id закреплённой шапки (или "-")
+  set-pin <chat_id> <message_id>
 """
 import json
 import os
@@ -36,6 +39,7 @@ def load():
         data = {}
     data.setdefault("current", {"session_id": "", "active": False})
     data.setdefault("saves", [])
+    data.setdefault("pins", {})
     return data
 
 
@@ -95,6 +99,11 @@ def main(argv):
                 print(fields(s["id"], s["branch"], s["head"], s["stash"],
                              s["session_id"], s["saved_at"]))
                 break
+    elif cmd == "get-pin":
+        print(fields(str(data["pins"].get(args[0], "") or "")))
+    elif cmd == "set-pin":
+        data["pins"][args[0]] = int(args[1])
+        save(data)
     elif cmd == "mark-restored":
         for s in data["saves"]:
             if s["id"] == args[0]:

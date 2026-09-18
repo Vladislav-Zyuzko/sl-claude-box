@@ -4,6 +4,7 @@
 #   STATUS_DIRTY:<число изменённых файлов>
 #   STATUS_ACTIVE:0|1            — дерево принадлежит идущему диалогу
 #   PENDING:<ветка>\t<saved_at>\t<stash sha или ->   — последний невосстановленный автосейв
+#   PIN:<message_id>             — закреплённая шапка состояния (если звали с chat_id)
 set -euo pipefail
 
 WORKDIR="${SWEET_LIMIT_DIR:-/workspace/sweet_limit}"
@@ -16,6 +17,10 @@ echo "STATUS_DIRTY:$(git -C "$WORKDIR" status --porcelain --untracked-files=all 
 
 IFS=$'\t' read -r _ CUR_ACTIVE < <(nexus-state get-current)
 echo "STATUS_ACTIVE:$CUR_ACTIVE"
+
+if [ -n "${1:-}" ]; then
+  echo "PIN:$(nexus-state get-pin "$1")"
+fi
 
 PENDING="$(nexus-state pending)"
 if [ -n "$PENDING" ]; then

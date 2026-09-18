@@ -19,7 +19,7 @@ import tempfile
 from typing import List, Optional
 
 from telegram import Update, BotCommand, BotCommandScopeChat
-from telegram.error import TimedOut
+from telegram.error import BadRequest, TimedOut
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 import asyncssh
@@ -345,6 +345,65 @@ class Progress:
             await self.bot.send_message(self.chat_id, text[i:i + 4000])
 
 
+# ===== ЗАКРЕПЛЁННАЯ ШАПКА СОСТОЯНИЯ =====
+# Telegram разрешает боту закреплять сообщения в личном чате без особых прав,
+# поэтому держим одно закреплённое сообщение и редактируем его. id храним в state
+# воркера — он переживает перезапуск бота.
+async def _worker_status(chat_id: int) -> dict:
+    code, out, _ = await _worker_run(f"repo-status.sh {chat_id}", timeout=60)
+    if code:
+        raise RuntimeError(f"repo-status.sh exit={code}")
+    info = {}
+    for line in out.splitlines():
+        key, _, val = line.partition(":")
+        info[key] = val.strip()
+    return info
+
+
+def _header_text(chat_id: int, info: dict) -> str:
+    branch = html.escape(info.get("STATUS_BRANCH", "?"))
+    dirty = info.get("STATUS_DIRTY", "0")
+    lines = [f"🌿 <b>{branch}</b>" + (f" · изменений: {dirty}" if dirty not in ("0", "") else " · чисто")]
+    if _sessions.get(chat_id):
+        lines.append("💬 диалог активен")
+    elif info.get("STATUS_ACTIVE") == "1":
+        lines.append("💬 диалог прерван (бот перезапускался) — /restore, чтобы продолжить его")
+    else:
+        lines.append("💬 диалога нет — следующее сообщение начнёт новый с develop")
+    pending = info.get("PENDING", "")
+    if pending:
+        p_branch, _, rest = pending.partition("\t")
+        saved_at, _, _stash = rest.partition("\t")
+        lines.append(f"💾 автосейв: <b>{html.escape(p_branch)}</b> ({html.escape(saved_at)}) — /restore")
+    return "\n".join(lines)
+
+
+async def _update_header(bot, chat_id: int, info: Optional[dict] = None):
+    """Обновить (или создать и закрепить) шапку состояния. Никогда не роняет задачу.
+    info — уже полученный ответ repo-status.sh, чтобы не ходить по SSH дважды."""
+    try:
+        if info is None:
+            info = await _worker_status(chat_id)
+        text = _header_text(chat_id, info)
+        pin_id = info.get("PIN", "")
+        if pin_id.isdigit():
+            try:
+                await bot.edit_message_text(text, chat_id, int(pin_id), parse_mode="HTML")
+                return
+            except BadRequest as e:
+                if "not modified" in str(e).lower():
+                    return
+                logger.info("Шапка недоступна (%s) — создаю новую", e)
+        msg = await bot.send_message(chat_id, text, parse_mode="HTML", disable_notification=True)
+        try:
+            await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
+        except Exception as e:
+            logger.warning("Не смог закрепить шапку: %s", e)
+        await _worker_run(f"nexus-state set-pin {chat_id} {msg.message_id}")
+    except Exception:
+        logger.exception("Не смог обновить шапку состояния")
+
+
 # ===== JOB-МОДЕЛЬ (одна задача за раз) =====
 _running = {"task": None}  # type: ignore
 
@@ -390,6 +449,7 @@ async def _execute(bot, chat_id: int, prompt: str, allow_gh: bool, new_photos: O
     pending_note = ""
     resume = _sessions.get(chat_id)   # продолжаем прежний диалог Nexus, если он есть
     session_id: Optional[str] = None
+    status: Optional[dict] = None     # ответ repo-status.sh: ветка в финале + шапка
     try:
         async for kind, payload in stream_task(prompt, allow_gh, new_photos, resume_session=resume):
             if kind == "event":
@@ -422,9 +482,13 @@ async def _execute(bot, chat_id: int, prompt: str, allow_gh: bool, new_photos: O
                 _sessions[chat_id] = session_id
                 await _bind_session(session_id)
             await prog.add("— финал —", force=True)
-            await prog.final(
-                f"{'✅ Готово' if ok else '❌ Ошибка'}\n\n{res_text or '(пустой ответ)'}{pending_note}"
-            )
+            try:
+                status = await _worker_status(chat_id)
+            except Exception:
+                logger.warning("Не смог получить состояние воркера для финала задачи")
+            branch = status.get("STATUS_BRANCH", "") if status else ""
+            head = f"{'✅ Готово' if ok else '❌ Ошибка'}" + (f" · 🌿 {branch}" if branch else "")
+            await prog.final(f"{head}\n\n{res_text or '(пустой ответ)'}{pending_note}")
         elif resume and "NEXUS_SESSION_MISMATCH" in stderr_tail:
             # Дерево уже не этого диалога: воркер перезапускался (работа ушла в автосейв,
             # сейчас develop). Молча продолжать на develop нельзя — сообщаем и забываем сессию.
@@ -456,6 +520,8 @@ async def _execute(bot, chat_id: int, prompt: str, allow_gh: bool, new_photos: O
     except Exception as e:
         logger.exception("Сбой задачи")
         await prog.final(f"💥 Непредвиденная ошибка: {str(e)[:400]}")
+    finally:
+        await _update_header(bot, chat_id, status)
 
 
 async def _execute_build(bot, chat_id: int):
@@ -588,6 +654,8 @@ async def _execute_build(bot, chat_id: int):
     except Exception as e:
         logger.exception("Сбой сборки")
         await prog.final(f"💥 Ошибка сборки: {str(e)[:400]}")
+    finally:
+        await _update_header(bot, chat_id)
 
 
 def _is_busy() -> bool:
@@ -663,7 +731,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/reset` — забыть контекст диалога; новый диалог начнётся с develop (работа уйдёт в автосейв)\n"
         "• `/restore` — вернуть прошлую работу: ветку, незакоммиченные правки и контекст диалога\n"
         "• `/cancel` — прервать текущую задачу\n"
-        "• `/help` — эта справка",
+        "• `/help` — эта справка\n\n"
+        "Сверху чата закреплена шапка состояния: ветка, число изменений и автосейв.",
         parse_mode="Markdown",
     )
 
@@ -880,6 +949,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _worker_run("nexus-state deactivate")
     except Exception:
         logger.exception("nexus-state deactivate failed")
+    await _update_header(update.get_bot(), update.effective_chat.id)
     await update.message.reply_text(
         ("🧹 Контекст диалога сброшен." if had else "Контекст и так пуст.")
         + " Следующее сообщение начнёт новый диалог с develop, "
@@ -944,6 +1014,7 @@ async def _execute_restore(bot, chat_id: int):
                  else "• контекста диалога нет — следующее сообщение начнёт новый, но на этой ветке")
     lines += [f"• {html.escape(n)}" for n in notes]
     await bot.edit_message_text("\n".join(lines), chat_id, msg.message_id, parse_mode="HTML")
+    await _update_header(bot, chat_id)
 
 
 async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1010,59 +1081,24 @@ BOT_COMMANDS = [
 
 
 async def _startup_notice(bot):
+    """При старте приводим шапку состояния в актуальный вид. Воркер может подниматься
+    дольше бота (entrypoint делает autosave до старта sshd) — поэтому ретраим."""
     try:
-        await _send_startup_notice(bot)
+        for attempt in range(30):
+            try:
+                await _worker_status(ALLOWED_USER_IDS[0])
+                break
+            except Exception:
+                if attempt == 29:
+                    logger.warning("Воркер недоступен — шапка состояния не обновлена")
+                    return
+                await asyncio.sleep(10)
+        for uid in ALLOWED_USER_IDS:
+            await _update_header(bot, uid)
     except Exception:
-        logger.exception("Стартовое уведомление упало")
+        logger.exception("Стартовая синхронизация упала")
     finally:
         _startup_checked.set()  # как бы ни кончилось — задачи больше не ждут
-
-
-async def _send_startup_notice(bot):
-    """После старта подсвечиваем несохранённую работу. Воркер может подниматься дольше
-    бота (entrypoint делает autosave до старта sshd) — поэтому ретраим."""
-    status = None
-    for _ in range(30):
-        try:
-            code, out, _ = await _worker_run("repo-status.sh", timeout=60)
-            if code == 0:
-                status = out
-                break
-        except Exception:
-            pass
-        await asyncio.sleep(10)
-    if status is None:
-        logger.warning("Воркер недоступен — уведомление о состоянии не отправлено")
-        return
-
-    info = {}
-    for line in status.splitlines():
-        key, _, val = line.partition(":")
-        info[key] = val
-    branch = html.escape(info.get("STATUS_BRANCH", "?"))
-    dirty = info.get("STATUS_DIRTY", "0").strip()
-
-    if info.get("STATUS_ACTIVE") == "1":
-        # перезапустился только бот: дерево по-прежнему за диалогом
-        text = (f"♻️ Я перезапустился. Рабочее дерево на ветке <code>{branch}</code>"
-                f" (изменённых файлов: {dirty}).\n\n"
-                "/restore — продолжить этот диалог\n"
-                "новое сообщение — новый диалог с develop (работа уйдёт в автосейв)")
-    elif "PENDING" in info:
-        p_branch, _, rest = info["PENDING"].partition("\t")
-        saved_at, _, stash = rest.partition("\t")
-        changes = "с незакоммиченными правками" if stash.strip() not in ("", "-") else "без незакоммиченных правок"
-        text = (f"⚠️ Работаю от <code>{branch}</code>. Есть несохранённая прошлая работа: "
-                f"ветка <code>{html.escape(p_branch)}</code>, {changes} (автосейв от {html.escape(saved_at)}).\n\n"
-                "/restore — вернуться к ней")
-    else:
-        return
-
-    for uid in ALLOWED_USER_IDS:
-        try:
-            await bot.send_message(uid, text, parse_mode="HTML")
-        except Exception as e:
-            logger.warning("Не смог отправить уведомление о состоянии %s: %s", uid, e)
 
 
 _background = set()  # держим ссылки на фоновые задачи, иначе их может собрать GC
