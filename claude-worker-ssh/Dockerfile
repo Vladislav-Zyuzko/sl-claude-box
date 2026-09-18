@@ -78,6 +78,21 @@ RUN echo "PermitRootLogin no" >> /etc/ssh/sshd_config && \
     echo "PasswordAuthentication no" >> /etc/ssh/sshd_config && \
     echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
 
+# --- Claude Code ---
+# Базовый образ sl-claude-box ставит claude-code сам, но пересобирается редко, поэтому
+# версия там замерзает. Ставим поверх свою — сборкой воркера, ею же и обновляем.
+#   CLAUDE_CODE_VERSION=latest  — тянуть свежую (по умолчанию), или точная версия для пина
+#   CLAUDE_REFRESH              — «ломатель» кеша: обычная пересборка берёт слой из кеша,
+#                                 а с --build-arg CLAUDE_REFRESH=$(date +%s) идёт в npm за новой
+# Слой держим ближе к концу файла: его инвалидация не тянет пересборку всего образа.
+# EBADENGINE про node>=22 при Node 18 — косметика: npm ставит нативный бинарь,
+# и claude при запуске Node не использует.
+ARG CLAUDE_CODE_VERSION=latest
+ARG CLAUDE_REFRESH=0
+RUN echo "claude refresh=${CLAUDE_REFRESH}" && \
+    npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} && \
+    claude --version
+
 EXPOSE 22
 
 # Создаём скрипт запуска (исправляет проблему с PID 1)

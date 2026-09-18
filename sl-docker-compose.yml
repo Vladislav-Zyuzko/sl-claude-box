@@ -3,9 +3,16 @@ services:
     build:
       context: ./claude-worker-ssh
       dockerfile: Dockerfile
+      args:
+        # версия Claude Code в образе; обновление — см. README
+        CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-latest}
+        CLAUDE_REFRESH: ${CLAUDE_REFRESH:-0}
     container_name: claude-worker
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      # обновляемся пересборкой образа: внутри контейнера автоапдейтер всё равно
+      # не может писать в /usr/local (claude стоит от root, задачи идут под claude-ssh)
+      - DISABLE_AUTOUPDATER=1
       # git/github auth + откуда и какую ветку тянуть
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - SWEET_LIMIT_REPO=${SWEET_LIMIT_REPO:-https://github.com/Tsezia/sweet_limit.git}
