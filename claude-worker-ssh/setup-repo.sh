@@ -91,6 +91,14 @@ else
   git -C "${WORKDIR}" reset --hard "origin/${BASE_BRANCH}"
   # clean -fd сносит untracked (ignored-артефакты вроде build/ и .env.* не трогаем)
   git -C "${WORKDIR}" clean -fd
+
+  # новый диалог начат поверх несохранённой работы — бот подсветит это в ответе
+  PENDING="$(nexus-state pending)"
+  if [ -n "$PENDING" ]; then
+    IFS=$'\t' read -r _ P_BRANCH P_HEAD _ _ P_SAVED_AT <<<"$PENDING"
+    [ "$P_BRANCH" = "-" ] && P_BRANCH="${P_HEAD:0:7}"
+    printf 'NEXUS_PENDING_AUTOSAVE:%s\t%s\n' "$P_BRANCH" "$P_SAVED_AT"
+  fi
 fi
 
 echo ">> готово. Текущий HEAD:"

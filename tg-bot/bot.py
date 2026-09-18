@@ -360,11 +360,34 @@ def _looks_like_stale_session(stderr: str) -> bool:
             or "--resume" in s or "no such session" in s)
 
 
+# Стартовая проверка состояния воркера (уведомление об автосейве). Задачи ждут её:
+# сообщения, накопившиеся пока бот лежал, иначе начали бы новый диалог на develop
+# раньше, чем пользователь увидит «есть несохранённая работа».
+_startup_checked = asyncio.Event()
+STARTUP_GATE_TIMEOUT = 180  # сек; дольше не держим — воркер, видимо, недоступен
+
+
+async def _wait_startup_check():
+    if _startup_checked.is_set():
+        return
+    try:
+        await asyncio.wait_for(_startup_checked.wait(), STARTUP_GATE_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.warning("Стартовая проверка не завершилась за %s с — запускаю задачу без неё",
+                       STARTUP_GATE_TIMEOUT)
+
+
+# Маркер setup-repo.sh: новый диалог начат, а несохранённая работа осталась в автосейве
+_PENDING_RE = re.compile(r"NEXUS_PENDING_AUTOSAVE:([^\t\n]*)\t([^\n]*)")
+
+
 async def _execute(bot, chat_id: int, prompt: str, allow_gh: bool, new_photos: Optional[List[str]] = None):
+    await _wait_startup_check()
     prog = Progress(bot, chat_id)
     await prog.start()
     result: Optional[dict] = None
     stderr_tail = ""
+    pending_note = ""
     resume = _sessions.get(chat_id)   # продолжаем прежний диалог Nexus, если он есть
     session_id: Optional[str] = None
     try:
@@ -380,7 +403,14 @@ async def _execute(bot, chat_id: int, prompt: str, allow_gh: bool, new_photos: O
                     if step:
                         await prog.add(step)
             elif kind == "end":
-                stderr_tail = (payload.get("stderr") or "")[-500:]
+                stderr_full = payload.get("stderr") or ""
+                stderr_tail = stderr_full[-500:]
+                m = None if resume else _PENDING_RE.search(stderr_full)
+                if m:
+                    pending_note = (
+                        f"\n\n💾 Это новый диалог с develop. Прошлая работа — ветка {m.group(1)} "
+                        f"(автосейв от {m.group(2).strip()}). /restore — вернуться к ней."
+                    )
                 if payload.get("exit"):
                     logger.warning("claude exit=%s stderr=%s", payload.get("exit"), stderr_tail)
 
@@ -392,7 +422,9 @@ async def _execute(bot, chat_id: int, prompt: str, allow_gh: bool, new_photos: O
                 _sessions[chat_id] = session_id
                 await _bind_session(session_id)
             await prog.add("— финал —", force=True)
-            await prog.final(f"{'✅ Готово' if ok else '❌ Ошибка'}\n\n{res_text or '(пустой ответ)'}")
+            await prog.final(
+                f"{'✅ Готово' if ok else '❌ Ошибка'}\n\n{res_text or '(пустой ответ)'}{pending_note}"
+            )
         elif resume and "NEXUS_SESSION_MISMATCH" in stderr_tail:
             # Дерево уже не этого диалога: воркер перезапускался (работа ушла в автосейв,
             # сейчас develop). Молча продолжать на develop нельзя — сообщаем и забываем сессию.
@@ -428,6 +460,7 @@ async def _execute(bot, chat_id: int, prompt: str, allow_gh: bool, new_photos: O
 
 async def _execute_build(bot, chat_id: int):
     """Детерминированная сборка APK (без LLM): прогон build-скрипта по SSH + доставка артефакта."""
+    await _wait_startup_check()
     prog = Progress(bot, chat_id)
     await prog.start("🔨 Собираю APK… (первый раз — несколько минут)")
     artifacts: List[str] = []
@@ -854,10 +887,17 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+_restored_chats: set = set()  # чаты, где уже был /restore (живёт до рестарта бота)
+
+
 async def _execute_restore(bot, chat_id: int):
     msg = await bot.send_message(chat_id, "♻️ Восстанавливаю прошлую работу…")
+    # Бот помнит диалог в этом чате -> текущее дерево и так его, просят именно автосейв.
+    # Не помнит (бот перезапускался) -> сначала подхватываем прерванный диалог в дереве.
+    # После /restore в этом чате дерево тоже «наше», даже без сессии.
+    flag = " --saved" if _sessions.get(chat_id) or chat_id in _restored_chats else ""
     try:
-        code, out, err = await _worker_run("restore-repo.sh", timeout=300)
+        code, out, err = await _worker_run(f"restore-repo.sh{flag}", timeout=300)
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -883,6 +923,7 @@ async def _execute_restore(bot, chat_id: int):
         await bot.edit_message_text("📭 Восстанавливать нечего — автосейвов нет.", chat_id, msg.message_id)
         return
 
+    _restored_chats.add(chat_id)
     session = info.get("RESTORED_SESSION") or None
     if session:
         _sessions[chat_id] = session
@@ -969,6 +1010,15 @@ BOT_COMMANDS = [
 
 
 async def _startup_notice(bot):
+    try:
+        await _send_startup_notice(bot)
+    except Exception:
+        logger.exception("Стартовое уведомление упало")
+    finally:
+        _startup_checked.set()  # как бы ни кончилось — задачи больше не ждут
+
+
+async def _send_startup_notice(bot):
     """После старта подсвечиваем несохранённую работу. Воркер может подниматься дольше
     бота (entrypoint делает autosave до старта sshd) — поэтому ретраим."""
     status = None

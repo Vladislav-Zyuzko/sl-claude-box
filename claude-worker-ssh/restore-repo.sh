@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Возвращает прошлую работу (команда /restore в боте).
 #
-#  1. Дерево уже «активное» (идущий диалог, например перезапустился только бот) —
-#     git не трогаем, просто отдаём боту текущую ветку и сессию.
-#  2. Иначе берём самый свежий невосстановленный автосейв: текущее дерево сначала
-#     автосейвится само, затем checkout ветки и `git stash apply <sha>`.
+#  restore-repo.sh --saved  бот сам ведёт диалог в этом чате — значит, просят именно
+#                           автосейв: берём самый свежий невосстановленный, текущее дерево
+#                           сначала автосейвится само, затем checkout ветки и `git stash apply <sha>`.
+#  restore-repo.sh          бот диалога не помнит (перезапускался). Если дерево «активное» —
+#                           это и есть прерванный диалог: git не трогаем, отдаём ветку и сессию
+#                           (про более старый автосейв сообщаем RESTORE_NOTE). Иначе — как --saved.
 #
 # Маркеры для бота (stdout):
 #   RESTORE_NONE                       — восстанавливать нечего
@@ -25,6 +27,9 @@ export SWEET_LIMIT_DIR="$WORKDIR"
 g() { git -C "$WORKDIR" "$@"; }
 undash() { [ "$1" = "-" ] && echo "" || echo "$1"; }
 
+SAVED_ONLY=0
+[ "${1:-}" = "--saved" ] && SAVED_ONLY=1
+
 if [ ! -d "$WORKDIR/.git" ]; then
   echo "RESTORE_NONE"
   exit 0
@@ -33,15 +38,20 @@ fi
 IFS=$'\t' read -r CUR_SESSION CUR_ACTIVE < <(nexus-state get-current)
 CUR_SESSION="$(undash "$CUR_SESSION")"
 
-if [ "$CUR_ACTIVE" = "1" ]; then
+PENDING="$(nexus-state pending)"
+
+if [ "$CUR_ACTIVE" = "1" ] && [ "$SAVED_ONLY" = "0" ]; then
   echo "RESTORED_BRANCH:$(g rev-parse --abbrev-ref HEAD)"
   echo "RESTORED_SESSION:$CUR_SESSION"
   echo "RESTORED_FROM:current"
   echo "RESTORED_STASH:none"
+  if [ -n "$PENDING" ]; then
+    IFS=$'\t' read -r _ P_BRANCH _ _ _ P_SAVED_AT <<<"$PENDING"
+    echo "RESTORE_NOTE:есть и более ранний автосейв (ветка $(undash "$P_BRANCH"), $P_SAVED_AT) — /restore ещё раз вернёт его"
+  fi
   exit 0
 fi
 
-PENDING="$(nexus-state pending)"
 if [ -z "$PENDING" ]; then
   echo "RESTORE_NONE"
   exit 0
