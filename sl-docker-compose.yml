@@ -38,6 +38,10 @@ services:
       - SSH_PORT=22
       - SSH_USER=claude-ssh
       - SSH_KEY_PATH=/ssh-key
+      # модель Nexus и субагентов: стартовая + список для меню /model
+      - NEXUS_MODEL=${NEXUS_MODEL:-claude-opus-5}
+      - NEXUS_MODELS=${NEXUS_MODELS:-}
+      - NEXUS_SUBAGENT_MODEL_FORCE=${NEXUS_SUBAGENT_MODEL_FORCE:-}
     volumes:
       - ./tg-bot:/app
       - ./ssh-key:/ssh-key

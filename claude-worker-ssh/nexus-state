@@ -8,6 +8,7 @@
   saves    — автосейвы (новые первыми, не больше MAX_SAVES):
              {id, branch, head, stash, session_id, saved_at, restored}
   pins     — chat_id -> message_id закреплённой в Telegram шапки состояния
+  model    — модель, выбранная через /model в боте (пусто = дефолт из окружения бота)
 
 Команды. Вывод — поля через таб, их парсят bash-скрипты. Пустое поле печатается
 как "-": иначе bash-овый read с IFS=таб склеил бы соседние разделители.
@@ -17,6 +18,8 @@
   add-save <branch|-> <head> <stash|-> <session_id|->   -> stash-sha вытесненных записей (по строке)
   pending                              -> id, branch, head, stash, session_id, saved_at (или пусто)
   mark-restored <id>
+  get-model                            -> выбранная модель (или "-")
+  set-model <model>
   get-pin <chat_id>                    -> message_id закреплённой шапки (или "-")
   set-pin <chat_id> <message_id>
 """
@@ -99,6 +102,11 @@ def main(argv):
                 print(fields(s["id"], s["branch"], s["head"], s["stash"],
                              s["session_id"], s["saved_at"]))
                 break
+    elif cmd == "get-model":
+        print(fields(data.get("model")))
+    elif cmd == "set-model":
+        data["model"] = undash(args[0])
+        save(data)
     elif cmd == "get-pin":
         print(fields(str(data["pins"].get(args[0], "") or "")))
     elif cmd == "set-pin":

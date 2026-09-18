@@ -56,8 +56,13 @@ npm view @anthropic-ai/claude-code version
 
 ## Бот
 
-Команды: `/pr`, `/fix`, `/build`, `/restore`, `/reset`, `/cancel`, `/clearphotos`, `/help`.
+Команды: `/pr`, `/fix`, `/build`, `/model`, `/restore`, `/reset`, `/cancel`, `/clearphotos`, `/help`.
 Сверху чата закреплена шапка состояния: ветка, число изменений, автосейв.
+
+Модель: `/model` показывает меню из `NEXUS_MODELS` и ставит выбранную и главному агенту
+(`--model`), и субагентам (`CLAUDE_CODE_SUBAGENT_MODEL`). Выбор хранится в воркере и переживает
+перезапуск бота; агент с `model:` во frontmatter перебивает его, если не задан
+`NEXUS_SUBAGENT_MODEL_FORCE=1`.
 
 Рабочее дерево: сообщение в идущем диалоге продолжает работу на его ветке; новый диалог и старт
 воркера сохраняют текущую работу в автосейв (`git stash` + `.git/nexus-state.json`) и начинают

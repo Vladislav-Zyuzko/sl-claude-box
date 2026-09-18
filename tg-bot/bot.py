@@ -18,9 +18,11 @@ import logging
 import tempfile
 from typing import List, Optional
 
-from telegram import Update, BotCommand, BotCommandScopeChat
+from telegram import (Update, BotCommand, BotCommandScopeChat,
+                      InlineKeyboardButton, InlineKeyboardMarkup)
 from telegram.error import BadRequest, TimedOut
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+                          filters, ContextTypes)
 
 import asyncssh
 
@@ -103,6 +105,76 @@ def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USER_IDS
 
 
+# ===== ВЫБОР МОДЕЛИ (/model) =====
+# Списка моделей у CLI нет, поэтому меню собирается из NEXUS_MODELS:
+# "<id>:<подпись>" через запятую. Выбор хранится в state воркера (переживает рестарт бота),
+# дефолт — NEXUS_MODEL.
+DEFAULT_MODELS = (
+    "claude-opus-5:Opus 5,"
+    "claude-sonnet-5:Sonnet 5,"
+    "claude-fable-5-1:Fable 5.1,"
+    "claude-haiku-4-5-20251001:Haiku 4.5"
+)
+
+
+def _parse_models(raw: str) -> List[tuple]:
+    out = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        model_id, _, label = item.partition(":")
+        model_id = model_id.strip()
+        if _MODEL_RE.match(model_id):
+            out.append((model_id, label.strip() or model_id))
+        else:
+            logger.warning("NEXUS_MODELS: пропускаю некорректный id %r", model_id)
+    return out
+
+
+# id уходит в shell-команду внутри одинарных кавычек — лишние символы туда пускать нельзя
+_MODEL_RE = re.compile(r"^[A-Za-z0-9._\-\[\]]+$")
+MODELS = _parse_models(os.environ.get("NEXUS_MODELS") or DEFAULT_MODELS)
+DEFAULT_MODEL = os.environ.get("NEXUS_MODEL", "").strip()
+if DEFAULT_MODEL and not _MODEL_RE.match(DEFAULT_MODEL):
+    raise ValueError(f"NEXUS_MODEL={DEFAULT_MODEL!r} — недопустимый id модели")
+if not DEFAULT_MODEL and MODELS:
+    DEFAULT_MODEL = MODELS[0][0]
+# CLAUDE_CODE_SUBAGENT_MODEL — только дефолт: агент с model: во frontmatter его перебьёт.
+# С NEXUS_SUBAGENT_MODEL_FORCE=1 модель навязывается всем субагентам, включая Explore/Plan.
+SUBAGENT_FORCE = os.environ.get("NEXUS_SUBAGENT_MODEL_FORCE", "").strip() == "1"
+
+_model = {"id": None}  # кэш выбранной модели; None — ещё не читали state воркера
+
+
+def _model_label(model_id: str) -> str:
+    for mid, label in MODELS:
+        if mid == model_id:
+            return label
+    return model_id
+
+
+async def _load_model() -> str:
+    """Выбранная модель: из state воркера, иначе дефолт из окружения."""
+    if _model["id"] is None:
+        chosen = ""
+        try:
+            code, out, _ = await _worker_run("nexus-state get-model")
+            if code == 0:
+                chosen = out.strip()
+        except Exception:
+            logger.warning("Не смог прочитать модель из state — беру дефолт")
+        if chosen in ("-", ""):
+            chosen = DEFAULT_MODEL
+        _model["id"] = chosen if _MODEL_RE.match(chosen or "") else DEFAULT_MODEL
+    return _model["id"]
+
+
+async def _set_model(model_id: str):
+    _model["id"] = model_id
+    await _worker_run(f"nexus-state set-model {model_id}")
+
+
 # ===== ЗАПУСК ЗАДАЧИ В ВОРКЕРЕ (SSH + stream-json) =====
 async def stream_task(prompt: str, allow_gh: bool, new_photos: Optional[List[str]] = None,
                       resume_session: Optional[str] = None):
@@ -140,12 +212,24 @@ async def stream_task(prompt: str, allow_gh: bool, new_photos: Optional[List[str
     # без неё — новый диалог: autosave и чистый develop.
     setup_flag = f"--session {resume_session} " if resume_session else ""
 
+    # Модель главного агента — флагом, субагентам — переменной окружения (у них
+    # своя система выбора: см. CLAUDE_CODE_SUBAGENT_MODEL в доке по субагентам).
+    model = await _load_model()
+    model_env = ""
+    model_flag = ""
+    if model:
+        model_env = f"CLAUDE_CODE_SUBAGENT_MODEL={model} "
+        if SUBAGENT_FORCE:
+            model_env += "CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1 "
+        model_flag = f"--model {model} "
+
     inner = (
         f"cd {PROJECT_DIR} && "
         # --add-dir падает на несуществующем пути: гарантируем каталог до запуска
         f"mkdir -p {PHOTOS_DIR} && "
         f"setup-repo.sh {setup_flag}1>&2 && "
-        "claude -p --output-format stream-json --verbose "
+        f"{model_env}claude -p --output-format stream-json --verbose "
+        f"{model_flag}"
         f"{resume_flag}"
         # PHOTOS_DIR лежит вне cwd, а Claude читает только рабочий каталог и то,
         # что явно добавлено --add-dir: без этого allowlist-правило не сработает.
@@ -156,8 +240,8 @@ async def stream_task(prompt: str, allow_gh: bool, new_photos: Optional[List[str
     # login-shell, чтобы подхватился /etc/profile.d/worker-env.sh с токенами
     remote_cmd = f"bash -lc '{inner}'"
 
-    logger.info("SSH задача (gh=%s, photos=%s, resume=%s): %s",
-                allow_gh, bool(new_photos), bool(resume_session), inner)
+    logger.info("SSH задача (gh=%s, photos=%s, resume=%s, model=%s): %s",
+                allow_gh, bool(new_photos), bool(resume_session), model, inner)
 
     async with _ssh() as conn:
         # подмешиваем в промпт сведения о приложенных/накопленных фото
@@ -728,6 +812,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/pr <задача>` — задача + открыть PR в develop\n"
         "• `/fix [уточнение]` — прочитать замечания к открытому PR и выкатить правки в ту же ветку\n"
         "• `/build` — собрать APK текущего состояния и прислать сюда\n"
+        "• `/model` — выбрать модель для Nexus и субагентов\n"
         "• `/reset` — забыть контекст диалога; новый диалог начнётся с develop (работа уйдёт в автосейв)\n"
         "• `/restore` — вернуть прошлую работу: ветку, незакоммиченные правки и контекст диалога\n"
         "• `/cancel` — прервать текущую задачу\n"
@@ -1026,6 +1111,57 @@ async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _running["task"] = asyncio.create_task(_execute_restore(update.get_bot(), update.effective_chat.id))
 
 
+async def _model_keyboard(current: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(("✅ " if mid == current else "") + label,
+                                  callback_data=f"model:{mid}")]
+            for mid, label in MODELS]
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    if _is_busy():
+        await update.message.reply_text("⚠️ Идёт задача — смена модели собьёт её. Дождись или /cancel.")
+        return
+    current = await _load_model()
+    arg = (update.message.text or "").partition(" ")[2].strip()
+    if arg:  # текстом: /model claude-sonnet-5
+        if not _MODEL_RE.match(arg):
+            await update.message.reply_text("Недопустимый id модели.")
+            return
+        await _set_model(arg)
+        await update.message.reply_text(
+            f"✅ Модель: {_model_label(arg)}\nПрименится со следующего сообщения."
+        )
+        return
+    await update.message.reply_text(
+        f"Модель Nexus и субагентов.\nСейчас: <b>{html.escape(_model_label(current))}</b>",
+        parse_mode="HTML", reply_markup=await _model_keyboard(current),
+    )
+
+
+async def on_model_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_allowed(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    model_id = (query.data or "").partition(":")[2]
+    if not _MODEL_RE.match(model_id):
+        await query.answer("Недопустимая модель", show_alert=True)
+        return
+    if _is_busy():
+        await query.answer("Идёт задача — смена модели собьёт её", show_alert=True)
+        return
+    await _set_model(model_id)
+    await query.answer("Готово")
+    await query.edit_message_text(
+        f"✅ Модель: <b>{html.escape(_model_label(model_id))}</b>\n"
+        "Применится со следующего сообщения (контекст диалога сохраняется).",
+        parse_mode="HTML", reply_markup=await _model_keyboard(model_id),
+    )
+
+
 async def cmd_build(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
@@ -1072,6 +1208,7 @@ BOT_COMMANDS = [
     BotCommand("pr", "Задача + открыть PR в develop"),
     BotCommand("fix", "Поправить открытый PR по замечаниям"),
     BotCommand("build", "Собрать APK и прислать сюда"),
+    BotCommand("model", "Выбрать модель Nexus и субагентов"),
     BotCommand("reset", "Сбросить контекст диалога"),
     BotCommand("restore", "Вернуть прошлую работу (ветка + правки + диалог)"),
     BotCommand("cancel", "Прервать текущую задачу"),
@@ -1124,9 +1261,11 @@ def main():
     app.add_handler(CommandHandler("fix", cmd_fix))
     app.add_handler(CommandHandler("build", cmd_build))
     app.add_handler(CommandHandler("clearphotos", cmd_clearphotos))
+    app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("restore", cmd_restore))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CallbackQueryHandler(on_model_choice, pattern=r"^model:"))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
