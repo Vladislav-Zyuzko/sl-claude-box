@@ -106,6 +106,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# basicConfig выше ставит INFO на корневой логгер, и httpx начинает печатать URL
+# каждого запроса. У Telegram Bot API токен лежит ПРЯМО В ПУТИ URL
+# (api.telegram.org/bot<TOKEN>/getUpdates), то есть на INFO он утекал в
+# `docker logs` при каждом опросе. Библиотеки держим на WARNING.
+for _noisy in ("httpx", "httpcore", "telegram.ext.Updater"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 
 def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USER_IDS
