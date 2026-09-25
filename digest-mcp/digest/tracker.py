@@ -3,14 +3,19 @@
 Свой REST-клиент к трекеру здесь сознательно НЕ пишется: доступ к задачам идёт
 только через инструменты этого MCP-сервера.
 
-Про контракт. Имена инструментов и форма их ответа принадлежат sl-tracker-mcp, а
-не нам, поэтому:
-  • имена лежат в TOOLS и переопределяются через SL_TRACKER_TOOLS (JSON) —
-    подгонка под реальный сервер не требует правки кода;
-  • разбор ответа терпимый: поля ищутся по нескольким вероятным именам
-    (items/issues/data, key/id, title/summary), объект-или-строка для assignee;
-  • probe() зовёт tools/list и говорит, какие имена сервер реально отдаёт —
-    первый запуск сам сообщит о расхождении вместо тихой пустой выдачи.
+Важное про контракт: инструменты sl-tracker-mcp отдают **человекочитаемый текст**,
+а не JSON — сервер написан под LLM и structuredContent не заполняет. Поэтому ниже
+парсеры прозы, а не разбор объектов. Форматы сняты с живого сервера 25.09.2026 и
+закреплены тестами на реальных образцах (tests/test_tracker.py): если автор сервера
+поменяет формулировки, тесты покажут это сразу, а не дайджест в 08:00.
+
+Инструменты (проверено через tools/list):
+    list_queues(project?)               — очереди проекта и их статусы
+    list_issues(queue, status?, limit?)  — задачи очереди, без описания
+    get_task(key, includeComments?)      — описание + комментарии ОДНИМ вызовом
+Имена переопределяются переменной SL_TRACKER_TOOLS (JSON), если контракт поменяется.
+`list_comments` не используем: includeComments у get_task отдаёт то же самое и
+экономит по вызову на каждую задачу.
 
 Наружу модуль отдаёт только list[Task] — остальной дайджест про MCP не знает.
 """
@@ -18,7 +23,8 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx2
 from mcp import Client
@@ -28,14 +34,25 @@ from .models import Comments, Task
 
 logger = logging.getLogger(__name__)
 
-# Ожидаемые имена инструментов sl-tracker-mcp. Переопределяются переменной
-# SL_TRACKER_TOOLS, например: {"issues": "tracker_list_issues"}
 TOOLS: Dict[str, str] = {
-    "queues": "list_queues",       # очереди проекта
-    "issues": "list_issues",       # задачи очереди с фильтром по статусам
-    "issue": "get_issue",          # одна задача (нужна из-за отсутствия description в списке)
-    "comments": "list_comments",   # комментарии задачи (нужен total и последний)
+    "queues": "list_queues",
+    "issues": "list_issues",
+    "issue": "get_task",
 }
+
+NOT_ASSIGNED = "не назначен"
+
+# «  MOBILE («Flutter задачи»): open=«Открыт», in_progress=«В работе», ...»
+_QUEUE_RE = re.compile(r"^\s+([A-Za-z0-9_-]+)\s*\(«(.*?)»\)\s*:\s*(.*)$")
+# «- MOBILE-1: «Заголовок» · статус in_progress («В работе») · исполнитель X · приоритет 50»
+_ISSUE_RE = re.compile(r"^-\s*([A-Za-z0-9]+-\d+)\s*:\s*(.*)$")
+_TITLE_RE = re.compile(r"^«(.*)»$")
+_STATUS_SEG_RE = re.compile(r"^статус\s+(\S+)(?:\s*\(«(.*?)»\))?")
+_PRIORITY_SEG_RE = re.compile(r"^приоритет\s+(-?\d+)")
+_ASSIGNEE_SEG_RE = re.compile(r"^исполнитель\s+(.+)$")
+# «комментарии (3):» и «- автор (2026-09-24T06:31:23.117Z): текст»
+_COMMENTS_HEAD_RE = re.compile(r"^комментарии\s*\((\d+)\)\s*:")
+_COMMENT_RE = re.compile(r"^-\s*(.*?)\s*\((\d{4}-\d{2}-\d{2}T[^)]*)\)\s*:\s*(.*)$")
 
 
 def _tools() -> Dict[str, str]:
@@ -54,50 +71,114 @@ def _tools() -> Dict[str, str]:
     return merged
 
 
-def _first(d: Dict[str, Any], *names: str, default: Any = None) -> Any:
-    """Первое непустое из вероятных имён поля."""
-    for n in names:
-        if n in d and d[n] not in (None, ""):
-            return d[n]
-    return default
+# ───────────────────────── парсеры ответов ─────────────────────────
 
 
-def _rows(payload: Any) -> List[Dict[str, Any]]:
-    """Список записей из ответа инструмента, в какой бы обёртке он ни пришёл."""
-    if payload is None:
-        return []
-    if isinstance(payload, list):
-        return [r for r in payload if isinstance(r, dict)]
-    if isinstance(payload, dict):
-        for key in ("items", "issues", "queues", "comments", "results", "data"):
-            val = payload.get(key)
-            if isinstance(val, list):
-                return [r for r in val if isinstance(r, dict)]
-        # одиночный объект — тоже валидный ответ (get_issue)
-        return [payload]
-    return []
+def parse_queues(text: str) -> List[Tuple[str, str]]:
+    """Очереди из ответа list_queues: [(key, name)].
+
+    Строка проекта идёт без отступа («sweet-limit: Sweet Limit»), очереди — с
+    отступом, поэтому различаем по нему, а не по содержимому.
+    """
+    out: List[Tuple[str, str]] = []
+    for line in (text or "").splitlines():
+        m = _QUEUE_RE.match(line)
+        if m:
+            out.append((m.group(1), m.group(2)))
+    return out
 
 
-def _name_of(value: Any) -> Optional[str]:
-    """assignee/author приходит объектом {displayName,...} либо уже строкой."""
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value or None
-    if isinstance(value, dict):
-        return _first(value, "displayName", "display_name", "name", "login", "email")
-    return None
+def parse_issues(text: str) -> List[Dict[str, Any]]:
+    """Задачи из ответа list_issues.
+
+    Хвост строки делим по « · » и опознаём сегменты по префиксу, а не по позиции:
+    состав полей у сервера меняется от задачи к задаче («исполнитель не назначен»,
+    отсутствующий приоритет).
+    """
+    out: List[Dict[str, Any]] = []
+    for line in (text or "").splitlines():
+        m = _ISSUE_RE.match(line.strip())
+        if not m:
+            continue
+        key, tail = m.group(1), m.group(2)
+        row: Dict[str, Any] = {"key": key, "title": "", "status": "", "status_name": "",
+                               "assignee": None, "priority": None}
+        for i, seg in enumerate(s.strip() for s in tail.split("·")):
+            if i == 0:
+                t = _TITLE_RE.match(seg)
+                row["title"] = t.group(1) if t else seg
+                continue
+            ms = _STATUS_SEG_RE.match(seg)
+            if ms:
+                row["status"] = ms.group(1)
+                row["status_name"] = ms.group(2) or ""
+                continue
+            mp = _PRIORITY_SEG_RE.match(seg)
+            if mp:
+                row["priority"] = int(mp.group(1))
+                continue
+            ma = _ASSIGNEE_SEG_RE.match(seg)
+            if ma:
+                name = ma.group(1).strip()
+                row["assignee"] = None if name == NOT_ASSIGNED else name
+                continue
+        if not row["title"]:
+            logger.warning("не разобрал строку задачи: %s", line[:120])
+        out.append(row)
+    return out
 
 
-def _status_pair(value: Any) -> tuple:
-    """(key, name) статуса. В review/testing category == in_progress, поэтому
-    фильтровать и показывать надо именно key, а не категорию."""
-    if isinstance(value, dict):
-        return (_first(value, "key", "id", default="") or "",
-                _first(value, "name", "title", default="") or "")
-    if isinstance(value, str):
-        return (value, "")
-    return ("", "")
+def parse_task(text: str) -> Dict[str, Any]:
+    """Описание и комментарии из ответа get_task(includeComments=True).
+
+    Описание многострочное, поэтому забираем всё между «описание:» и либо
+    «комментарии (N):», либо концом текста.
+    """
+    desc: List[str] = []
+    total = 0
+    last_author: Optional[str] = None
+    last_body: Optional[str] = None
+
+    mode = None
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("описание:"):
+            mode = "desc"
+            rest = stripped[len("описание:"):].strip()
+            if rest:
+                desc.append(rest)
+            continue
+        mh = _COMMENTS_HEAD_RE.match(stripped)
+        if mh:
+            total = int(mh.group(1))
+            mode = "comments"
+            continue
+        if mode == "desc":
+            desc.append(line.rstrip())
+        elif mode == "comments":
+            mc = _COMMENT_RE.match(stripped)
+            if mc:
+                # последний в списке и есть самый свежий
+                last_author = mc.group(1) or None
+                last_body = mc.group(3) or None
+
+    return {
+        "description": "\n".join(desc).strip() or None,
+        "comments": Comments(total=total, last_author=last_author, last_body=last_body),
+    }
+
+
+def _text_of(result: Any) -> str:
+    """Склейка текстовых блоков ответа инструмента."""
+    out = []
+    for block in getattr(result, "content", None) or []:
+        text = getattr(block, "text", None)
+        if text:
+            out.append(text)
+    return "\n".join(out)
+
+
+# ───────────────────────── клиент ─────────────────────────
 
 
 class Tracker:
@@ -122,42 +203,23 @@ class Tracker:
             http_client=httpx2.AsyncClient(headers=headers, timeout=self._timeout),
         )
 
-    # ───────────────────────── низкий уровень ─────────────────────────
-
-    async def _payload(self, client: Client, tool: str, args: Dict[str, Any]) -> Any:
-        """Вызов инструмента + вытаскивание полезной нагрузки.
-
-        Предпочитаем structuredContent (машинная форма), иначе разбираем текстовый
-        блок как JSON — MCP-серверы часто отдают JSON строкой.
-        """
+    async def _text(self, client: Client, tool: str, args: Dict[str, Any]) -> str:
         result = await client.call_tool(tool, args)
         if getattr(result, "isError", False):
             raise RuntimeError(f"{tool}: сервер вернул ошибку: {_text_of(result)[:300]}")
-
-        structured = getattr(result, "structuredContent", None)
-        if structured:
-            return structured
-
-        text = _text_of(result)
-        if not text:
-            return None
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            raise RuntimeError(f"{tool}: ответ не JSON: {text[:200]}")
+        return _text_of(result)
 
     async def probe(self) -> Dict[str, Any]:
-        """Что сервер реально умеет. Зовётся на старте и в MCP-инструменте status:
-        если имена не совпали, это видно сразу и с конкретикой."""
+        """Что сервер реально умеет. Зовётся из MCP-инструмента status: если имена
+        не совпали, это видно сразу и с конкретикой."""
         async with Client(self._transport()) as client:
             listed = await client.list_tools()
             available = sorted(t.name for t in listed.tools)
-        expected = self.tools
-        missing = {slot: name for slot, name in expected.items() if name not in available}
+        missing = {slot: name for slot, name in self.tools.items() if name not in available}
         return {
             "url": self.url,
             "available": available,
-            "expected": expected,
+            "expected": self.tools,
             "missing": missing,
             "ok": not missing,
         }
@@ -169,49 +231,42 @@ class Tracker:
                            max_tasks: int = 30) -> List[Task]:
         """Активные задачи со всеми полями для дайджеста.
 
-        Порядок: очереди проекта -> задачи с фильтром по статусам -> описание и
-        комментарии по каждой задаче. Последние два шага — параллельно с
-        ограничением, иначе 30 задач превращаются в 60 последовательных вызовов
-        и прогон растягивается на минуты.
+        Очереди -> задачи с фильтром по статусам -> описание и комментарии.
+        Последний шаг параллельный с ограничением: последовательно 30 задач
+        растянули бы прогон на минуты.
         """
         async with Client(self._transport()) as client:
-            keys = list(queues or [])
             names: Dict[str, str] = {}
+            keys: List[str] = list(queues or [])
             if not keys:
-                payload = await self._payload(client, self.tools["queues"], {"project": project})
-                for row in _rows(payload):
-                    key = _first(row, "key", "slug", "id")
-                    if key:
-                        keys.append(str(key))
-                        names[str(key)] = _first(row, "name", "title", default="") or ""
+                text = await self._text(client, self.tools["queues"], {"project": project})
+                for key, name in parse_queues(text):
+                    keys.append(key)
+                    names[key] = name
+                if not keys:
+                    logger.warning("list_queues не дал ни одной очереди: %s", text[:200])
 
             tasks: List[Task] = []
             for queue in keys:
-                payload = await self._payload(client, self.tools["issues"], {
+                text = await self._text(client, self.tools["issues"], {
                     "queue": queue,
                     "status": ",".join(statuses),
                     "limit": max_tasks,
                 })
-                for row in _rows(payload):
-                    key = _first(row, "key", "id")
-                    if not key:
+                for row in parse_issues(text):
+                    # фильтр сервер применяет, но проверяем сами: у review/testing
+                    # категория тоже in_progress, надёжен только key статуса
+                    if statuses and row["status"] and row["status"] not in statuses:
                         continue
-                    status_key, status_name = _status_pair(row.get("status"))
-                    # сервер мог не применить фильтр — отсекаем сами, по key статуса
-                    if statuses and status_key and status_key not in statuses:
-                        continue
-                    queue_row = row.get("queue") if isinstance(row.get("queue"), dict) else None
-                    qkey = str(_first(queue_row or {}, "key", "id", default=queue) or queue)
                     tasks.append(Task(
-                        key=str(key),
-                        title=str(_first(row, "title", "summary", "name", default="") or ""),
-                        queue=qkey,
-                        queue_name=names.get(qkey) or (_first(queue_row or {}, "name", default="") or ""),
-                        status=status_key,
-                        status_name=status_name,
-                        assignee=_name_of(row.get("assignee")),
-                        priority=_as_int(row.get("priority")),
-                        description=_first(row, "description", "body"),
+                        key=row["key"],
+                        title=row["title"],
+                        queue=queue,
+                        queue_name=names.get(queue, ""),
+                        status=row["status"],
+                        status_name=row["status_name"],
+                        assignee=row["assignee"],
+                        priority=row["priority"],
                     ))
 
             tasks = sorted(tasks, key=lambda t: t.key)[:max_tasks]
@@ -219,65 +274,19 @@ class Tracker:
             return tasks
 
     async def _enrich(self, client: Client, tasks: List[Task]) -> None:
-        """Описание (в списке его нет) и признак обсуждения. Ошибка по одной
-        задаче не должна ронять весь дайджест — она лишь обедняет её строку."""
+        """Описание и комментарии — одним get_task на задачу. Ошибка по одной
+        задаче не роняет дайджест, а лишь обедняет её строку."""
         sem = asyncio.Semaphore(self._concurrency)
 
         async def one(task: Task) -> None:
             async with sem:
-                if not task.description:
-                    try:
-                        payload = await self._payload(client, self.tools["issue"], {"key": task.key})
-                        rows = _rows(payload)
-                        if rows:
-                            row = rows[0]
-                            task.description = _first(row, "description", "body")
-                            if not task.status_name:
-                                _, task.status_name = _status_pair(row.get("status"))
-                            if not task.assignee:
-                                task.assignee = _name_of(row.get("assignee"))
-                    except Exception as e:
-                        logger.warning("описание %s не получено: %s", task.key, str(e)[:160])
                 try:
-                    payload = await self._payload(client, self.tools["comments"],
-                                                  {"key": task.key, "limit": 1})
-                    task.comments = _comments_of(payload)
+                    text = await self._text(client, self.tools["issue"],
+                                            {"key": task.key, "includeComments": True})
+                    parsed = parse_task(text)
+                    task.description = parsed["description"]
+                    task.comments = parsed["comments"]
                 except Exception as e:
-                    logger.warning("комментарии %s не получены: %s", task.key, str(e)[:160])
+                    logger.warning("детали %s не получены: %s", task.key, str(e)[:160])
 
         await asyncio.gather(*(one(t) for t in tasks))
-
-
-def _comments_of(payload: Any) -> Comments:
-    total = 0
-    if isinstance(payload, dict):
-        total = _as_int(payload.get("total")) or 0
-    rows = _rows(payload)
-    # total может не прийти — тогда считаем по отданным записям
-    if not total:
-        total = len(rows)
-    if not rows:
-        return Comments(total=total)
-    last = rows[-1]
-    return Comments(
-        total=total,
-        last_author=_name_of(last.get("author")),
-        last_body=_first(last, "body", "text", "content"),
-    )
-
-
-def _as_int(value: Any) -> Optional[int]:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _text_of(result: Any) -> str:
-    """Склейка текстовых блоков ответа инструмента."""
-    out = []
-    for block in getattr(result, "content", None) or []:
-        text = getattr(block, "text", None)
-        if text:
-            out.append(text)
-    return "\n".join(out)
