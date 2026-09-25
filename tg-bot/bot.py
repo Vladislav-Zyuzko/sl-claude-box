@@ -58,6 +58,11 @@ FIGMA_DIR = os.environ.get("NEXUS_FIGMA_DIR", "/workspace/figma").rstrip("/")
 PHOTOS_RULE = "/" + PHOTOS_DIR if PHOTOS_DIR.startswith("/") else PHOTOS_DIR
 FIGMA_RULE = "/" + FIGMA_DIR if FIGMA_DIR.startswith("/") else FIGMA_DIR
 
+# Сервис дайджеста (контейнер nexus-digest). Бот только дёргает ручной прогон:
+# расписание, хранение и сбор живут в самом сервисе, MCP-клиент в образ бота не тащим.
+DIGEST_URL = os.environ.get("NEXUS_DIGEST_URL", "http://nexus-digest:8080").rstrip("/")
+DIGEST_TOKEN = os.environ.get("NEXUS_DIGEST_MCP_TOKEN", "").strip()
+
 # Таймауты отправки APK в Telegram (сек). Дефолты PTB — write 20 / read 5: ~27 МБ не успевали
 # уйти или Telegram не успевал ответить → TimedOut, хотя файл иногда всё же доходил.
 UPLOAD_WRITE_TIMEOUT = float(os.environ.get("UPLOAD_WRITE_TIMEOUT", "300"))
@@ -1320,6 +1325,42 @@ async def cmd_clearphotos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручной прогон дайджеста. Рассылку делает сервис nexus-digest — он же
+    владеет расписанием, поэтому ручной вызов плановый слот не отменяет."""
+    if not is_allowed(update.effective_user.id):
+        return
+    if not DIGEST_TOKEN:
+        await update.message.reply_text(
+            "⚠️ Дайджест не настроен: не задан NEXUS_DIGEST_MCP_TOKEN."
+        )
+        return
+    await update.message.reply_text("📋 Собираю дайджест…")
+    try:
+        # httpx приходит вместе с python-telegram-bot, отдельной зависимости не нужно
+        import httpx
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(
+                f"{DIGEST_URL}/run",
+                headers={"Authorization": f"Bearer {DIGEST_TOKEN}"},
+                json={"send": True},
+            )
+        if r.status_code != 200:
+            await update.message.reply_text(f"💥 Дайджест ответил {r.status_code}: {r.text[:300]}")
+            return
+        data = r.json()
+        if data.get("error"):
+            await update.message.reply_text(f"💥 Сбор не удался: {str(data['error'])[:300]}")
+            return
+        sent = (data.get("delivery") or {}).get("sent", 0)
+        await update.message.reply_text(
+            f"✅ Дайджест разослан ({sent}), активных задач: {data.get('active', 0)}."
+        )
+    except Exception as e:
+        logger.exception("digest failed")
+        await update.message.reply_text(f"💥 Не смог дёрнуть дайджест: {str(e)[:300]}")
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Update вызвал ошибку: %s", context.error)
 
@@ -1334,6 +1375,7 @@ BOT_COMMANDS = [
     BotCommand("reset", "Сбросить контекст диалога"),
     BotCommand("restore", "Вернуть прошлую работу (ветка + правки + диалог)"),
     BotCommand("cancel", "Прервать текущую задачу"),
+    BotCommand("digest", "Прислать дайджест активных задач сейчас"),
     BotCommand("clearphotos", "Удалить сохранённые фото"),
     BotCommand("help", "Справка по боту"),
 ]
@@ -1382,6 +1424,7 @@ def main():
     app.add_handler(CommandHandler("pr", cmd_pr))
     app.add_handler(CommandHandler("fix", cmd_fix))
     app.add_handler(CommandHandler("build", cmd_build))
+    app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("clearphotos", cmd_clearphotos))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("reset", cmd_reset))

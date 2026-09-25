@@ -44,6 +44,9 @@ services:
       - NEXUS_SUBAGENT_MODEL_FORCE=${NEXUS_SUBAGENT_MODEL_FORCE:-}
       # где в воркере лежит оффлайн-слепок Figma (заливается figma-snapshot.sh)
       - NEXUS_FIGMA_DIR=${NEXUS_FIGMA_DIR:-/workspace/figma}
+      # дайджест: адрес служебного маршрута и токен для команды /digest
+      - NEXUS_DIGEST_URL=${NEXUS_DIGEST_URL:-http://nexus-digest:8080}
+      - NEXUS_DIGEST_MCP_TOKEN=${NEXUS_DIGEST_MCP_TOKEN:-}
     volumes:
       - ./tg-bot:/app
       - ./ssh-key:/ssh-key
@@ -53,6 +56,40 @@ services:
       - claude-worker
     restart: unless-stopped
 
+  # Дайджест активных задач: собственное расписание, хранение и MCP-инструменты.
+  # Данные трекера берёт только через sl-tracker-mcp (чужой сервис, не правим).
+  nexus-digest:
+    build:
+      context: ./digest-mcp
+      dockerfile: Dockerfile
+    container_name: nexus-digest
+    environment:
+      # тот же токен и тот же список адресатов, что у бота — один источник
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
+      # источник данных — MCP трекера
+      - SL_TRACKER_MCP_URL=${SL_TRACKER_MCP_URL}
+      - SL_TRACKER_MCP_TOKEN=${SL_TRACKER_MCP_TOKEN:-}
+      # переопределение имён инструментов sl-tracker-mcp (JSON), если они иные
+      - SL_TRACKER_TOOLS=${SL_TRACKER_TOOLS:-}
+      - SL_TRACKER_PROJECT=${SL_TRACKER_PROJECT:-sweet-limit}
+      # пусто = все очереди проекта
+      - NEXUS_DIGEST_QUEUES=${NEXUS_DIGEST_QUEUES:-}
+      - NEXUS_DIGEST_STATUSES=${NEXUS_DIGEST_STATUSES:-in_progress,review,testing}
+      - NEXUS_DIGEST_TIMES=${NEXUS_DIGEST_TIMES:-08:00,20:00}
+      - NEXUS_DIGEST_TZ=${NEXUS_DIGEST_TZ:-Asia/Omsk}
+      - NEXUS_DIGEST_LATE_LIMIT_MIN=${NEXUS_DIGEST_LATE_LIMIT_MIN:-60}
+      - NEXUS_DIGEST_MAX_TASKS=${NEXUS_DIGEST_MAX_TASKS:-30}
+      - NEXUS_DIGEST_KEEP_DAYS=${NEXUS_DIGEST_KEEP_DAYS:-90}
+      - NEXUS_DIGEST_MCP_TOKEN=${NEXUS_DIGEST_MCP_TOKEN:-}
+    volumes:
+      - digest-data:/data       # state.json + snapshots.jsonl, переживают пересборку
+    # порт наружу НЕ публикуем: MCP доступен только внутри compose-сети
+    expose:
+      - "8080"
+    restart: unless-stopped
+
 volumes:
   toolchain:
   claude-home:
+  digest-data:
