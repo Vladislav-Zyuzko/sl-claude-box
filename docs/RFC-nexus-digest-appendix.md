@@ -162,3 +162,58 @@
 - `zoneinfo`, доступность трекера, сети, монтирования, список адресатов — командами
   `docker exec` / `docker inspect` на боевом сервере.
 - Расхождение с `develop` — `git diff` боевых файлов против `origin/develop`.
+
+---
+
+## 7. Что `sl-tracker-mcp` отдаёт на самом деле (проверено 25.09.2026)
+
+Сервер расширен под дайджест: было 6 инструментов, стало **8**. Ничего из старого не
+переименовано, поэтому `sl-tracker-mcp` продолжает работать как раньше.
+
+| Инструмент | Аргументы | Ответ (structuredContent) |
+|---|---|---|
+| `list_queues` | `project?` | `{items: [{project, key, name}], projects: {<slug>: [{key, name}]}}` |
+| `list_issues` | `queue`, `status?`, `limit?` | `{queue, statuses, total, items: [{key, title, queue: {key}, status: {key, name, category}, priority, storyPoints, assignee: {id, displayName, avatarUrl} \| null}]}` |
+| `list_comments` | `key`, `limit?` | `{key, total, items: [{id, body, author: {id, displayName, avatarUrl}, createdAt, editedAt}], canComment}` |
+| `get_task` | `key`, `includeComments?` | карточка задачи: `description`, `status` **строкой**, `assignee` **строкой** или `null` |
+
+Остальные четыре — `create_task`, `update_task_description`, `add_comment`,
+`set_task_status` — без изменений.
+
+### Готовый блок для `.env`
+
+```ini
+SL_TRACKER_MCP_URL=https://mcp.72-56-41-79.sslip.io:8443/mcp
+SL_TRACKER_MCP_TOKEN=<MCP_CLIENT_TOKEN из /opt/sl-tracker/.env, 64 hex>
+# единственное расхождение имён: у сервера инструмент называется get_task, а не get_issue
+SL_TRACKER_TOOLS={"issue":"get_task"}
+```
+
+`queues`, `issues` и `comments` совпадают с именами по умолчанию в `tracker.py`, поэтому
+переопределять их не нужно. `SL_TRACKER_MCP_TOKEN` — это **клиентский токен MCP-сервера**
+(64 hex), а не PAT трекера (80 символов, `uuid.verifier`): с PAT сервер отвечает 401.
+
+Блок стоит добавить и в `.env.example` репозитория (в коммите с дайджестом он не появился,
+там только ссылки из compose).
+
+### Как проверено
+
+Из контейнера `telegram-bot` (та же compose-сеть, что у `nexus-digest`), по публичному
+адресу, тем же способом разбора ответа, что в `digest-mcp/digest/tracker.py`:
+
+```
+tools/list: 8 -> add_comment, create_task, get_task, list_comments, list_issues,
+                list_queues, set_task_status, update_task_description
+list_queues(project=sweet-limit): 2 -> [('MOBILE', 'Flutter задачи'),
+                                       ('INFRA', 'Инфраструктурные задачи')]
+list_issues(INFRA, in_progress,review,testing): total 1, строк 1
+    INFRA-4 | Проверка MCP-сервера | статус in_progress «В работе»
+    | исполнитель None | приоритет 50 | описания в строке нет (добирается get_task)
+list_comments(INFRA-4): total 1 | последний автор zyuzko2002 | текст: Мост работает…
+```
+
+То есть путь дайджеста «`list_queues` → `list_issues` → `get_task`/`list_comments`» на
+боевом трекере работает целиком. Живая проверка того же пути одной командой —
+`node --import tsx scripts/smoke-live.ts` в `sl-tracker-mcp` (печатает 8 инструментов,
+очереди и активные задачи).
+
