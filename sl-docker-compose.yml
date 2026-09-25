@@ -42,6 +42,8 @@ services:
       - NEXUS_MODEL=${NEXUS_MODEL:-claude-opus-5}
       - NEXUS_MODELS=${NEXUS_MODELS:-}
       - NEXUS_SUBAGENT_MODEL_FORCE=${NEXUS_SUBAGENT_MODEL_FORCE:-}
+      # где в воркере лежит оффлайн-слепок Figma (заливается figma-snapshot.sh)
+      - NEXUS_FIGMA_DIR=${NEXUS_FIGMA_DIR:-/workspace/figma}
     volumes:
       - ./tg-bot:/app
       - ./ssh-key:/ssh-key

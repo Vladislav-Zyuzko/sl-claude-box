@@ -48,9 +48,15 @@ PROJECT_DIR = os.environ.get("SWEET_LIMIT_DIR", "/workspace/sweet_limit")
 # Живут до явной /clearphotos — Nexus их НЕ удаляет.
 PHOTOS_DIR = os.environ.get("NEXUS_PHOTOS_DIR", "/tmp/nexus-uploads").rstrip("/")
 
+# Оффлайн-слепок Figma: index.json + tokens.json + frames/<node-id>.{json,png}.
+# Кладётся в volume /workspace (переживает рестарты и сброс дерева sweet_limit),
+# заливается с машины дизайнера скриптом figma-snapshot.sh. В git не попадает.
+FIGMA_DIR = os.environ.get("NEXUS_FIGMA_DIR", "/workspace/figma").rstrip("/")
+
 # В правилах permissions Claude Code одиночный ведущий "/" означает путь ОТ ИСТОЧНИКА
 # НАСТРОЕК, а не от корня ФС; абсолютный путь пишется с "//". Отсюда лишний слеш.
 PHOTOS_RULE = "/" + PHOTOS_DIR if PHOTOS_DIR.startswith("/") else PHOTOS_DIR
+FIGMA_RULE = "/" + FIGMA_DIR if FIGMA_DIR.startswith("/") else FIGMA_DIR
 
 # Таймауты отправки APK в Telegram (сек). Дефолты PTB — write 20 / read 5: ~27 МБ не успевали
 # уйти или Telegram не успевал ответить → TimedOut, хотя файл иногда всё же доходил.
@@ -200,6 +206,7 @@ async def stream_task(prompt: str, allow_gh: bool, new_photos: Optional[List[str
         "Bash(make *)",     # у проекта есть Makefile с хелперами (напр. make pg)
         "mcp__dart",        # все инструменты Dart MCP-сервера, если он поднят в воркере
         f"Read({PHOTOS_RULE}/**)",
+        f"Read({FIGMA_RULE}/**)",   # слепок Figma: спеки кадров и рендеры
     ]
     if allow_gh:
         allowed.append("Bash(gh *)")
@@ -225,15 +232,15 @@ async def stream_task(prompt: str, allow_gh: bool, new_photos: Optional[List[str
 
     inner = (
         f"cd {PROJECT_DIR} && "
-        # --add-dir падает на несуществующем пути: гарантируем каталог до запуска
-        f"mkdir -p {PHOTOS_DIR} && "
+        # --add-dir падает на несуществующем пути: гарантируем каталоги до запуска
+        f"mkdir -p {PHOTOS_DIR} {FIGMA_DIR} && "
         f"setup-repo.sh {setup_flag}1>&2 && "
         f"{model_env}claude -p --output-format stream-json --verbose "
         f"{model_flag}"
         f"{resume_flag}"
-        # PHOTOS_DIR лежит вне cwd, а Claude читает только рабочий каталог и то,
-        # что явно добавлено --add-dir: без этого allowlist-правило не сработает.
-        f"--add-dir {PHOTOS_DIR} "
+        # PHOTOS_DIR и FIGMA_DIR лежат вне cwd, а Claude читает только рабочий каталог
+        # и то, что явно добавлено --add-dir: без этого allowlist-правило не сработает.
+        f"--add-dir {PHOTOS_DIR} --add-dir {FIGMA_DIR} "
         "--mcp-config /usr/local/etc/dart-mcp.json "
         f"--permission-mode acceptEdits {tools}"
     )
@@ -248,6 +255,11 @@ async def stream_task(prompt: str, allow_gh: bool, new_photos: Optional[List[str
         note = await _photos_prompt_note(conn, new_photos)
         if note:
             prompt = prompt + note
+
+        # ссылки на Figma в задаче -> пути к спекам из слепка
+        figma_note = await _figma_prompt_note(conn, prompt)
+        if figma_note:
+            prompt = prompt + figma_note
 
         proc = await conn.create_process(remote_cmd)
 
@@ -320,6 +332,109 @@ async def _photos_prompt_note(conn, new_photos: Optional[List[str]]) -> str:
             f"иначе не обращай на них внимания:\n{body}"
         )
     return ""
+
+
+# ===== FIGMA: ссылка на кадр -> спека из оффлайн-слепка =====
+_FIGMA_LINK_RE = re.compile(
+    r"https?://(?:www\.)?figma\.com/(?:design|file|proto)/[A-Za-z0-9_-]+[^\s]*", re.I
+)
+# node-id в ссылке пишется через дефис (1-23), в API — через двоеточие (1:23),
+# а при копировании из браузера двоеточие бывает закодировано как %3A.
+_NODE_ID_RE = re.compile(r"node[-_]id=([0-9]+(?:%3A|%3a|:|-)[0-9]+)", re.I)
+
+
+def _figma_nodes(text: str) -> List[str]:
+    """node-id из всех figma-ссылок текста в виде имён файлов слепка ('1-23')."""
+    found: List[str] = []
+    for link in _FIGMA_LINK_RE.findall(text or ""):
+        m = _NODE_ID_RE.search(link)
+        if not m:
+            continue
+        node = re.sub(r"%3A|%3a|:", "-", m.group(1))
+        if node not in found:
+            found.append(node)
+    return found
+
+
+async def _sftp_size(sftp, path: str) -> Optional[int]:
+    """Размер файла в воркере, либо None если его нет.
+    Через stat: он есть в любой версии asyncssh."""
+    try:
+        st = await sftp.stat(path)
+        return getattr(st, "size", 0) or 0
+    except Exception:
+        return None
+
+
+# Спеку тяжелее этого порога Read целиком не вытянет — агенту нужен offset/limit.
+FIGMA_HEAVY_SPEC = 150 * 1024
+
+
+async def _figma_prompt_note(conn, prompt: str) -> str:
+    """Приписка к промпту: где лежат спеки кадров, на которые ссылается задача."""
+    nodes = _figma_nodes(prompt)
+    if not nodes:
+        return ""
+
+    try:
+        async with conn.start_sftp_client() as sftp:
+            has_snapshot = await _sftp_size(sftp, f"{FIGMA_DIR}/index.json") is not None
+            found: List[tuple] = []
+            missing: List[str] = []
+            for node in nodes:
+                spec = f"{FIGMA_DIR}/frames/{node}.json"
+                size = await _sftp_size(sftp, spec)
+                if size is None:
+                    missing.append(node)
+                    continue
+                png = f"{FIGMA_DIR}/frames/{node}.png"
+                has_png = await _sftp_size(sftp, png) is not None
+                found.append((node, spec, png if has_png else None, size))
+    except Exception:
+        logger.exception("Не смог проверить слепок Figma")
+        return ""
+
+    if not has_snapshot:
+        return (
+            "\n\nВ задаче есть ссылка на Figma, но слепок дизайна на сервер ещё не залит "
+            f"({FIGMA_DIR}/index.json отсутствует). Скажи об этом пользователю: нужно "
+            "пересобрать слепок скриптом figma-snapshot.sh."
+        )
+
+    lines = []
+    heavy = False
+    for node, spec, png, size in found:
+        img = f", рендер `{png}`" if png else ""
+        note = ""
+        if size >= FIGMA_HEAVY_SPEC:
+            heavy = True
+            note = " — файл большой, читай частями (offset/limit), а не целиком"
+        lines.append(f"- кадр `{node}`: спека `{spec}` ({size // 1024} КБ){img}{note}")
+    for node in missing:
+        lines.append(
+            f"- кадр `{node}`: в слепке нет — вероятно, слепок устарел или кадр не "
+            "верхнего уровня. Сообщи об этом пользователю."
+        )
+
+    body = "\n".join(lines)
+    tail = (
+        " Тяжёлую спеку не тяни целиком: сначала прочитай начало, найди нужный "
+        "фрагмент дерева и дочитывай с offset."
+        if heavy else ""
+    )
+    return (
+        "\n\nЗадача ссылается на Figma. Сама Figma тебе недоступна, но на сервере лежит "
+        f"её оффлайн-слепок:\n{body}\n"
+        "Спека — это дерево узлов с точными размерами, hex-цветами, текстами, шрифтами, "
+        "скруглениями и auto-layout (отступы, spacing, выравнивание). Открывай её "
+        "инструментом Read и верстай по числам из неё, а не на глаз по картинке. "
+        "У узлов бывает поле `styles` с именем стиля Figma (`primary/0`, `Header 1`) — "
+        "это прямая ссылка на токен дизайн-системы: бери соответствующий символ из uikit, "
+        "а не сырой hex. Иконки схлопнуты в один узел с `vectorGraphic: true` — важны его "
+        "имя, размер и `graphicFill`. "
+        f"Общие стили и переменные файла — `{FIGMA_DIR}/tokens.json`, карта всех кадров — "
+        f"`{FIGMA_DIR}/index.json`.{tail}"
+    )
 
 
 async def _store_photos(items: List[tuple]) -> List[str]:

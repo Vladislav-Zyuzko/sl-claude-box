@@ -85,3 +85,6 @@ desktop.ini
 *.swp
 *.swo
 *~
+
+# Локальный слепок Figma (заливается на сервер скриптом, в git не нужен)
+figma-snapshot/
