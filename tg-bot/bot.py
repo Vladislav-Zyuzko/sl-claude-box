@@ -60,6 +60,10 @@ FIGMA_RULE = "/" + FIGMA_DIR if FIGMA_DIR.startswith("/") else FIGMA_DIR
 
 # Сервис дайджеста (контейнер nexus-digest). Бот только дёргает ручной прогон:
 # расписание, хранение и сбор живут в самом сервисе, MCP-клиент в образ бота не тащим.
+# Сборки проекта: точки входа lib/main_<flavor>.dart со своими .env.<flavor>.
+# Android-флейворов у проекта нет, поэтому различать сборки можно только так.
+BUILD_FLAVORS = ("dev", "prod")
+
 DIGEST_URL = os.environ.get("NEXUS_DIGEST_URL", "http://nexus-digest:8080").rstrip("/")
 DIGEST_TOKEN = os.environ.get("NEXUS_DIGEST_MCP_TOKEN", "").strip()
 
@@ -735,14 +739,25 @@ async def _execute(bot, chat_id: int, prompt: str, allow_gh: bool, new_photos: O
         await _update_header(bot, chat_id, status)
 
 
-async def _execute_build(bot, chat_id: int):
-    """Детерминированная сборка APK (без LLM): прогон build-скрипта по SSH + доставка артефакта."""
+async def _execute_build(bot, chat_id: int, flavor: str = "prod"):
+    """Детерминированная сборка APK (без LLM): прогон build-скрипта по SSH + доставка артефакта.
+
+    flavor — dev или prod: Android-флейворов у проекта нет, но есть две точки входа
+    (lib/main_dev.dart / lib/main_prod.dart), каждая со своим .env. Остальное решает
+    build-apk.sh, здесь только передаём выбор."""
+    if flavor not in BUILD_FLAVORS:
+        raise ValueError(f"flavor должен быть одним из {BUILD_FLAVORS}, получено {flavor!r}")
     await _wait_startup_check()
     prog = Progress(bot, chat_id)
-    await prog.start("🔨 Собираю APK… (первый раз — несколько минут)")
+    await prog.start(f"🔨 Собираю APK ({flavor})… (первый раз — несколько минут)")
     artifacts: List[str] = []
     try:
-        remote_cmd = "bash -lc 'setup-toolchain.sh 1>&2 && build-apk.sh'"
+        # BUILD_FLAVOR ставим перед build-apk.sh, а не перед всей строкой: префикс перед
+        # первой командой до второй бы не дошёл. flavor из закрытого списка — безопасно.
+        remote_cmd = (
+            "bash -lc 'setup-toolchain.sh 1>&2 && "
+            f"BUILD_FLAVOR={flavor} build-apk.sh'"
+        )
         async with asyncssh.connect(
             SSH_HOST,
             port=SSH_PORT,
@@ -783,7 +798,7 @@ async def _execute_build(bot, chat_id: int):
             await proc.wait()
 
             if proc.exit_status:
-                await prog.final(f"❌ Сборка упала (exit {proc.exit_status}).\n\n{stderr_tail}")
+                await prog.final(f"❌ Сборка {flavor} упала (exit {proc.exit_status}).\n\n{stderr_tail}")
                 return
             if not artifacts:
                 await prog.final("⚠️ Сборка прошла, но APK не найден.")
@@ -845,7 +860,7 @@ async def _execute_build(bot, chat_id: int):
                             pass
 
             if sent and not skipped and not unconfirmed:
-                await prog.final("✅ Сборка готова, APK отправлен.")
+                await prog.final(f"✅ Сборка {flavor} готова, APK отправлен.")
             elif unconfirmed and not sent and not skipped:
                 await prog.final("✅ Сборка готова, но отправка APK не подтвердилась — путь на сервере выше.")
             elif sent or unconfirmed:
@@ -938,7 +953,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/clearphotos` — очистить сохранённые фото\n"
         "• `/pr <задача>` — задача + открыть PR в develop\n"
         "• `/fix [уточнение]` — прочитать замечания к открытому PR и выкатить правки в ту же ветку\n"
-        "• `/build` — собрать APK текущего состояния и прислать сюда\n"
+        "• `/build_dev` / `/build_prod` — собрать APK нужной сборки и прислать сюда\n"
         "• `/model` — выбрать модель для Nexus и субагентов\n"
         "• `/reset` — забыть контекст диалога; новый диалог начнётся с develop (работа уйдёт в автосейв)\n"
         "• `/restore` — вернуть прошлую работу: ветку, незакоммиченные правки и контекст диалога\n"
@@ -1289,7 +1304,8 @@ async def on_model_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_build(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _start_build(update: Update, flavor: str):
+    """Общая обвязка /build_dev и /build_prod: доступ, занятость, запуск."""
     if not is_allowed(update.effective_user.id):
         return
     t = _running.get("task")
@@ -1298,7 +1314,21 @@ async def cmd_build(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     bot = update.get_bot()
-    _running["task"] = asyncio.create_task(_execute_build(bot, chat_id))
+    _running["task"] = asyncio.create_task(_execute_build(bot, chat_id, flavor))
+
+
+async def cmd_build_dev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _start_build(update, "dev")
+
+
+async def cmd_build_prod(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _start_build(update, "prod")
+
+
+async def cmd_build(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Старый /build оставлен синонимом prod — чтобы не ломать привычку и ссылки
+    в заметках. В меню его нет: там только /build_dev и /build_prod."""
+    await _start_build(update, "prod")
 
 
 async def cmd_clearphotos(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1370,7 +1400,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 BOT_COMMANDS = [
     BotCommand("pr", "Задача + открыть PR в develop"),
     BotCommand("fix", "Поправить открытый PR по замечаниям"),
-    BotCommand("build", "Собрать APK и прислать сюда"),
+    BotCommand("build_dev", "Собрать dev-APK и прислать сюда"),
+    BotCommand("build_prod", "Собрать prod-APK и прислать сюда"),
     BotCommand("model", "Выбрать модель Nexus и субагентов"),
     BotCommand("reset", "Сбросить контекст диалога"),
     BotCommand("restore", "Вернуть прошлую работу (ветка + правки + диалог)"),
@@ -1423,7 +1454,9 @@ def main():
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("pr", cmd_pr))
     app.add_handler(CommandHandler("fix", cmd_fix))
-    app.add_handler(CommandHandler("build", cmd_build))
+    app.add_handler(CommandHandler("build_dev", cmd_build_dev))
+    app.add_handler(CommandHandler("build_prod", cmd_build_prod))
+    app.add_handler(CommandHandler("build", cmd_build))   # синоним prod
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("clearphotos", cmd_clearphotos))
     app.add_handler(CommandHandler("model", cmd_model))

@@ -56,7 +56,18 @@ npm view @anthropic-ai/claude-code version
 
 ## Бот
 
-Команды: `/pr`, `/fix`, `/build`, `/model`, `/restore`, `/reset`, `/cancel`, `/clearphotos`, `/help`.
+Команды: `/pr`, `/fix`, `/build_dev`, `/build_prod`, `/model`, `/restore`, `/reset`, `/cancel`,
+`/clearphotos`, `/digest`, `/help`.
+
+Сборок две: `dev` и `prod`. Это не Android-флейворы — их у проекта нет, — а точки входа
+`lib/main_dev.dart` и `lib/main_prod.dart`, каждая грузит свой `.env.dev` / `.env.prod`.
+Обе собираются в release, различить их можно только по имени файла, поэтому APK приходит
+как `app-dev-release-…apk` или `app-prod-release-…apk`. `/build` остался синонимом prod.
+
+> `.env.dev` и `.env.prod` объявлены ассетами в `pubspec.yaml`, но лежат в `.gitignore`,
+> то есть в клон не попадают. В рабочем дереве воркера они живут постоянно (`git clean -fd`
+> игнорируемые файлы не трогает). Если дерево пересоздадут с нуля — положить вручную,
+> иначе сборка остановится с понятной ошибкой ещё до `pub get`.
 Сверху чата закреплена шапка состояния: ветка, число изменений, автосейв.
 
 Модель: `/model` показывает меню из `NEXUS_MODELS` и ставит выбранную и главному агенту
